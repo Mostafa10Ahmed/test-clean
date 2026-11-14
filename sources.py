@@ -10,7 +10,7 @@ from urllib.parse import ParseResult, urljoin, urlparse
 import aiohttp
 
 MAX_REDIRECTS = 5
-_DRIVE_FILE_RE = re.compile(r"drive\.google\.com/file/d/([\w-]+)")
+_DRIVE_FILE_RE = re.compile(r"/file/d/([\w-]+)")
 _DRIVE_OPEN_RE = re.compile(r"[?&]id=([\w-]+)")
 _GOFILE_RE = re.compile(r"gofile\.io/d/(\w+)")
 _CONFIRM_RE = re.compile(r'confirm=([0-9A-Za-z_-]+)')
@@ -47,10 +47,12 @@ def validate_url(url: str) -> ParseResult:
 def classify_link(url: str) -> tuple[str, str]:
     """يرجّع (النوع, الرابط المحول). النوع: drive / gofile / direct."""
     url = url.strip()
-    if "drive.google.com" in url:
+    if "drive.google.com" in url or "drive.usercontent.google.com" in url or "docs.google.com" in url:
+        if "/folders/" in url:
+            raise SourceError("This is a Drive folder link. Share the chapter as a single zip file instead")
         match = _DRIVE_FILE_RE.search(url) or _DRIVE_OPEN_RE.search(url)
         if not match:
-            raise SourceError("Could not find the file ID in the Google Drive link")
+            raise SourceError("Could not find the file ID in the Google Drive link. Use the file's Share > Copy link")
         return "drive", f"https://drive.google.com/uc?export=download&id={match.group(1)}"
     match = _GOFILE_RE.search(url)
     if match:
