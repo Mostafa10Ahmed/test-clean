@@ -14,6 +14,7 @@ import hashlib
 import io
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -240,12 +241,20 @@ async def clean_chapter_local(
     names = output_names([name for name, _ in pages])
 
     loop = asyncio.get_running_loop()
+    total = len(pages)
+    started = time.monotonic()
+    done = 0
+    log.info("Whitening %d pages (profile=%s, concurrency=%d)", total, profile, concurrency)
     with ThreadPoolExecutor(max_workers=max(1, concurrency), thread_name_prefix="whiten") as pool:
         async def run(name: str, data: bytes) -> bytes:
+            nonlocal done
             try:
-                return await loop.run_in_executor(pool, clean_page_bytes, data, model_path, profile)
+                result = await loop.run_in_executor(pool, clean_page_bytes, data, model_path, profile)
             except Exception as exc:
                 raise LocalCleanError(f"Failed to whiten page `{name}`: {exc}") from exc
+            done += 1
+            log.info("Page %d/%d done (%s) - %.0fs elapsed", done, total, name, time.monotonic() - started)
+            return result
 
         results = await asyncio.gather(*(run(name, data) for name, data in pages))
     return build_zip(list(zip(names, results)))
