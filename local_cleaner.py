@@ -1,0 +1,254 @@
+"""التبييض جوه البوت نفسه، من غير أي سيرفر أو مشروع تاني.
+
+الخطوات لكل صفحة:
+1. موديل CTD (comic-text-detector، ملف ONNX بيتحمّل أوتوماتيك أول مرة) بيطلع mask لمكان الكلام.
+2. كل حتة كلام بنبص على الحلقة اللي حواليها:
+   - لو الخلفية سادة (فقاعة بيضا أو لون واحد) بنملاها بنفس اللون، وده تبييض نضيف 100%.
+   - لو الكلام فوق رسمة بنعمل inpaint: LaMa لو مكتبة simple-lama-inpainting متسطّبة (بروفايل perfect)،
+     وإلا OpenCV (أخف وأسرع بس أقل جودة).
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import io
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+
+import aiohttp
+import cv2
+import numpy as np
+from PIL import Image
+
+from whitening import build_zip, extract_pages, output_names
+
+log = logging.getLogger("whiten-bot.local")
+
+MODEL_URL = "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/comictextdetector.pt.onnx"
+MODEL_FILE = "comictextdetector.pt.onnx"
+MODEL_SHA256 = "1a86ace74961413cbd650002e7bb4dcec4980ffa21b2f19b86933372071d718f"
+INPUT_SIZE = 1024  # الموديل متصدّر بمدخل ثابت 1024x1024
+
+# إعدادات البروفايلات للمحرك المدمج
+_SETTINGS = {
+    "perfect": {"mask_thresh": 0.3, "dilate": 5, "use_lama": True},
+    "fast": {"mask_thresh": 0.35, "dilate": 4, "use_lama": False},
+}
+
+
+class LocalCleanError(RuntimeError):
+    pass
+
+
+# ---------- تحميل الموديل ----------
+_download_lock = asyncio.Lock()
+
+
+async def ensure_model(model_dir: str) -> Path:
+    path = Path(model_dir) / MODEL_FILE
+    if path.exists():
+        return path
+    async with _download_lock:
+        if path.exists():
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        log.info("Downloading text detector model (first run only)...")
+        tmp = path.with_suffix(".part")
+        digest = hashlib.sha256()
+        timeout = aiohttp.ClientTimeout(total=1800)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(MODEL_URL) as resp:
+                    if resp.status != 200:
+                        raise LocalCleanError(f"model download failed: HTTP {resp.status}")
+                    with tmp.open("wb") as fh:
+                        async for chunk in resp.content.iter_chunked(1 << 20):
+                            digest.update(chunk)
+                            fh.write(chunk)
+        except aiohttp.ClientError as exc:
+            raise LocalCleanError(f"model download failed: {exc}") from exc
+        if digest.hexdigest() != MODEL_SHA256:
+            tmp.unlink(missing_ok=True)
+            raise LocalCleanError("model download is corrupted (hash mismatch)")
+        tmp.replace(path)
+        log.info("Model saved to %s", path)
+        return path
+
+
+# ---------- الكشف ----------
+_thread_state = threading.local()
+
+
+def _get_net(model_path: Path) -> "cv2.dnn.Net":
+    # cv2.dnn.Net مش thread-safe، فكل thread ليه نسخته
+    net = getattr(_thread_state, "net", None)
+    if net is None:
+        net = cv2.dnn.readNetFromONNX(str(model_path))
+        _thread_state.net = net
+        _thread_state.outputs = net.getUnconnectedOutLayersNames()
+    return net
+
+
+def _detect_tile(rgb: np.ndarray, model_path: Path) -> np.ndarray:
+    """احتمالية وجود كلام لكل بكسل (float32 بنفس حجم الـ tile)."""
+    h, w = rgb.shape[:2]
+    scale = INPUT_SIZE / max(h, w)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+    canvas = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
+    canvas[:nh, :nw] = resized  # padding تحت وعلى اليمين زي letterbox بتاع CTD
+
+    net = _get_net(model_path)
+    net.setInput(cv2.dnn.blobFromImage(canvas, scalefactor=1 / 255.0))
+    outputs = net.forward(_thread_state.outputs)
+    # مخرجات CTD: blocks و seg mask (1x1xHxW) و lines map. بناخد الـ seg mask بالشكل
+    seg = next(
+        (o for o in outputs if o.ndim == 4 and o.shape[1] == 1 and o.shape[2] == INPUT_SIZE),
+        None,
+    )
+    if seg is None:
+        raise LocalCleanError(f"unexpected detector outputs: {[o.shape for o in outputs]}")
+    prob = seg[0, 0, :nh, :nw].astype(np.float32)
+    return cv2.resize(prob, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _tiles(length: int, tile: int, overlap: int) -> list[int]:
+    if length <= tile:
+        return [0]
+    step = tile - overlap
+    starts = list(range(0, length - tile, step))
+    starts.append(length - tile)
+    return starts
+
+
+def detect_text_mask(rgb: np.ndarray, model_path: Path, thresh: float) -> np.ndarray:
+    """mask (0/255) لمكان الكلام. الصفحات الطويلة (ويبتون) بتتقسم مربعات عشان الكلام ما يصغرش."""
+    h, w = rgb.shape[:2]
+    prob = np.zeros((h, w), dtype=np.float32)
+    if h > w * 1.5:
+        side = w
+        for y in _tiles(h, side, side // 8):
+            part = _detect_tile(rgb[y:y + side], model_path)
+            np.maximum(prob[y:y + side], part, out=prob[y:y + side])
+    elif w > h * 1.5:
+        side = h
+        for x in _tiles(w, side, side // 8):
+            part = _detect_tile(rgb[:, x:x + side], model_path)
+            np.maximum(prob[:, x:x + side], part, out=prob[:, x:x + side])
+    else:
+        prob = _detect_tile(rgb, model_path)
+    return (prob > thresh).astype(np.uint8) * 255
+
+
+# ---------- المسح ----------
+_lama = None
+_lama_lock = threading.Lock()
+_lama_checked = False
+
+
+def _get_lama():
+    global _lama, _lama_checked
+    with _lama_lock:
+        if not _lama_checked:
+            _lama_checked = True
+            try:
+                from simple_lama_inpainting import SimpleLama  # type: ignore
+
+                _lama = SimpleLama()
+                log.info("LaMa inpainting enabled")
+            except Exception as exc:  # المكتبة اختيارية
+                log.info("LaMa not available (%s); using OpenCV inpainting", exc)
+        return _lama
+
+
+def _inpaint_region(rgb: np.ndarray, mask: np.ndarray, use_lama: bool) -> np.ndarray:
+    lama = _get_lama() if use_lama else None
+    if lama is not None:
+        with _lama_lock:
+            out = lama(Image.fromarray(rgb), Image.fromarray(mask))
+        out = np.asarray(out.convert("RGB"))[: rgb.shape[0], : rgb.shape[1]]
+        result = rgb.copy()
+        result[mask > 0] = out[mask > 0]
+        return result
+    return cv2.inpaint(rgb, mask, 5, cv2.INPAINT_TELEA)
+
+
+def clean_image(rgb: np.ndarray, model_path: Path, profile: str) -> np.ndarray:
+    settings = _SETTINGS[profile]
+    raw = detect_text_mask(rgb, model_path, settings["mask_thresh"])
+    if not raw.any():
+        return rgb
+
+    k = settings["dilate"]
+    mask = cv2.dilate(raw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
+    # نجمّع الحروف القريبة في بلوك واحد عشان نحكم على الخلفية بتاعة الجملة كلها
+    groups = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(groups, connectivity=8)
+
+    out = rgb.copy()
+    h, w = rgb.shape[:2]
+    ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    for label in range(1, count):
+        x, y, bw, bh, _ = stats[label]
+        pad = 24
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+        region_mask = np.where((labels[y0:y1, x0:x1] == label) & (mask[y0:y1, x0:x1] > 0), 255, 0).astype(np.uint8)
+        if not region_mask.any():
+            continue
+        crop = out[y0:y1, x0:x1]
+
+        # الحلقة اللي حوالين الكلام تقول لنا الخلفية سادة ولا رسمة
+        ring = cv2.dilate(region_mask, ring_kernel) > 0
+        ring &= region_mask == 0
+        ring_pixels = crop[ring]
+        if len(ring_pixels) >= 20:
+            spread = np.percentile(ring_pixels, 90, axis=0) - np.percentile(ring_pixels, 10, axis=0)
+            if spread.max() <= 30:
+                crop[region_mask > 0] = np.median(ring_pixels, axis=0).astype(np.uint8)
+                continue
+
+        out[y0:y1, x0:x1] = _inpaint_region(crop, region_mask, settings["use_lama"])
+    return out
+
+
+def clean_page_bytes(data: bytes, model_path: Path, profile: str) -> bytes:
+    with Image.open(io.BytesIO(data)) as im:
+        rgb = np.asarray(im.convert("RGB"))
+    cleaned = clean_image(np.ascontiguousarray(rgb), model_path, profile)
+    ok, png = cv2.imencode(".png", cv2.cvtColor(cleaned, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise LocalCleanError("failed to encode PNG")
+    return png.tobytes()
+
+
+# ---------- الفصل كامل ----------
+async def clean_chapter_local(
+    zip_bytes: bytes,
+    *,
+    profile: str,
+    model_dir: str,
+    concurrency: int = 2,
+) -> bytes:
+    if profile not in _SETTINGS:
+        raise LocalCleanError(f"Unknown profile: {profile}")
+    model_path = await ensure_model(model_dir)
+    pages = extract_pages(zip_bytes)
+    names = output_names([name for name, _ in pages])
+
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(max_workers=max(1, concurrency), thread_name_prefix="whiten") as pool:
+        async def run(name: str, data: bytes) -> bytes:
+            try:
+                return await loop.run_in_executor(pool, clean_page_bytes, data, model_path, profile)
+            except Exception as exc:
+                raise LocalCleanError(f"Failed to whiten page `{name}`: {exc}") from exc
+
+        results = await asyncio.gather(*(run(name, data) for name, data in pages))
+    return build_zip(list(zip(names, results)))
+
+
+__all__ = ["LocalCleanError", "clean_chapter_local", "clean_image", "ensure_model"]

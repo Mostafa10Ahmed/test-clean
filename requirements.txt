@@ -1,0 +1,10 @@
+discord.py>=2.4
+aiohttp>=3.9
+python-dotenv>=1.0
+# محرك التبييض المدمج
+opencv-python-headless>=4.8
+numpy>=1.26
+Pillow>=10.0
+# اختياري: جودة أعلى للكلام اللي فوق الرسومات (بروفايل perfect). تقيلة (torch)
+# simple-lama-inpainting>=0.1.2
+pytest>=8.0
