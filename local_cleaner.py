@@ -90,6 +90,10 @@ cv2.setNumThreads(CPU_THREADS)
 # طول الـ tile في الصفحات الطويلة كنسبة من العرض. أكبر = أسرع (tiles أقل) وأقل دقة قليلاً. 1 = الأدق
 # المحرك: auto (onnxruntime لو الرامات 2GB+، وإلا cv2.dnn الأخف)، أو ort، أو cv2
 DETECTOR = (os.getenv("DETECTOR") or "auto").strip().lower()
+# الصفحات الطويلة (ويبتون مدموج) بتتعالج على أشرطة، كل شريط حوالي BAND_PIXELS بكسل، عشان الرامات
+# متزيدش مع طول الصفحة. أقل = رامات أقل
+BAND_PIXELS = int(_env_float("BAND_PIXELS", 3_000_000))
+BAND_MARGIN = 160  # صفوف سياق فوق وتحت كل شريط عشان الكلام اللي على الحدود
 TILE_RATIO = min(2.0, max(1.0, _env_float("TILE_RATIO", 1.5)))
 
 # إعدادات البروفايلات للمحرك المدمج
@@ -322,11 +326,48 @@ def clean_image(rgb: np.ndarray, model_path: Path, profile: str) -> np.ndarray:
     return out
 
 
+def clean_image_banded(rgb: np.ndarray, model_path: Path, profile: str) -> np.ndarray:
+    """بيعالج الصفحة الطويلة على أشرطة. بيعدّل المصفوفة نفسها (لازم تكون قابلة للكتابة)."""
+    h, w = rgb.shape[:2]
+    band = max(512, BAND_PIXELS // max(1, w))
+    if h <= band + 2 * BAND_MARGIN:
+        return clean_image(rgb, model_path, profile)
+
+    prev_tail = None
+    y = 0
+    while y < h:
+        y1 = min(h, y + band)
+        # لو الشريط الأخير قصير جداً نضمّه للي قبله
+        if h - y1 < BAND_MARGIN * 2:
+            y1 = h
+        parts = []
+        if prev_tail is not None:
+            parts.append(prev_tail)
+        top_len = 0 if prev_tail is None else len(prev_tail)
+        parts.append(rgb[y:y1])
+        if y1 < h:
+            parts.append(rgb[y1:min(h, y1 + BAND_MARGIN)])
+        crop = np.concatenate(parts) if len(parts) > 1 else rgb[y:y1]
+        next_tail = rgb[max(y, y1 - BAND_MARGIN):y1].copy() if y1 < h else None  # الأصل قبل ما نعدّله
+
+        cleaned = clean_image(crop, model_path, profile)
+        rgb[y:y1] = cleaned[top_len:top_len + (y1 - y)]
+        del crop, cleaned, parts
+        prev_tail = next_tail
+        y = y1
+    return rgb
+
+
 def clean_page_bytes(data: bytes, model_path: Path, profile: str) -> bytes:
-    with Image.open(io.BytesIO(data)) as im:
-        rgb = np.asarray(im.convert("RGB"))
-    cleaned = clean_image(np.ascontiguousarray(rgb), model_path, profile)
-    ok, png = cv2.imencode(".png", cv2.cvtColor(cleaned, cv2.COLOR_RGB2BGR))
+    # cv2.imdecode بيفك الصورة في نسخة واحدة بس (PIL بيعمل كذا نسخة وده بيفرق في الصفحات الطويلة)
+    bgr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if bgr is None:
+        with Image.open(io.BytesIO(data)) as im:
+            bgr = cv2.cvtColor(np.asarray(im.convert("RGB")), cv2.COLOR_RGB2BGR)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB, dst=bgr)  # بدون نسخة جديدة
+    cleaned = clean_image_banded(rgb, model_path, profile)
+    out = cv2.cvtColor(cleaned, cv2.COLOR_RGB2BGR, dst=cleaned)
+    ok, png = cv2.imencode(".png", out)
     if not ok:
         raise LocalCleanError("failed to encode PNG")
     return png.tobytes()
