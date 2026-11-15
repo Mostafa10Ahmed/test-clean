@@ -4,7 +4,7 @@ from __future__ import annotations
 import io
 import re
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 MAX_PAGES = 400
@@ -62,7 +62,6 @@ def output_names(names: list[str], ext: str = ".png") -> list[str]:
 
 
 def build_zip(pages: list[tuple[str, bytes]]) -> bytes:
-    # PNG مضغوط أصلاً، فالـ STORED أسرع بكتير ومفيش فايدة من ضغط تاني
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as zf:
         for name, data in pages:
