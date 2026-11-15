@@ -5,6 +5,10 @@ python-dotenv>=1.0
 opencv-python-headless>=4.8
 numpy>=1.26
 onnxruntime>=1.17
+# سيرفر الـ worker (اختياري، لو هتشغّل خدمة worker منفصلة)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
 Pillow>=10.0
 # اختياري: جودة أعلى للكلام اللي فوق الرسومات (بروفايل perfect). تقيلة (torch)
 # simple-lama-inpainting>=0.1.2

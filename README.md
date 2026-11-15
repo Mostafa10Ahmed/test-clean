@@ -58,6 +58,17 @@ python bot.py
 
 لو الفولدر فيه ملف zip واحد بس من غير صور، بيحمّله ويبيّضه.
 
+## خدمة worker منفصلة (اختياري)
+
+البوت بيفضل خفيف، والتبييض بيتعمل في خدمة تانية. فايدتها الحقيقية إن الـ worker لو وقع من الرامات البوت مبيقعش ولا الطابور بيضيع. ولازم الـ worker يكون على سيرفر **رامات أكتر**، وإلا مفيش فرق.
+
+1. في نفس الريبو اعمل خدمة تانية على Railway (**New ← GitHub Repo** لنفس الريبو).
+2. Settings ← **Config as Code** ← الـ path = `/railway.worker.json`.
+3. Variables للـ worker: `WORKER_TOKEN` (قيمة طويلة عشوائية) و`WORKER_ENGINE=builtin` و`MODEL_DIR=/data/models` و`MALLOC_ARENA_MAX=2`، وحط Volume على `/data`.
+4. Settings ← Networking ← **Generate Domain**.
+5. في خدمة البوت: `WORKER_URL=https://<دومين الـ worker>` و`WORKER_TOKEN` بنفس القيمة، و`CLEAN_ENGINE=remote`.
+6. اختبر: افتح `https://<الدومين>/health`، لازم يرجع `{"ok":true,"engine":"builtin"}`.
+
 ## الأوامر
 
 - `/clean chapter:<ملف zip>` أو `/clean link:<لينك>` + `profile:<perfect|fast>` — بيضيف الفصل للطابور ويرجعلك رابط gofile لما يخلص.

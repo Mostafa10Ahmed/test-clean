@@ -14,12 +14,17 @@ import sys
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import Response
 
-from cli_cleaner import CliCleanError, clean_chapter_cli
 from profiles import PROFILE_CHOICES
 
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 TRANSLATOR_REPO = os.environ.get("TRANSLATOR_REPO", "/content/manga-translator-ui")
 WORK_ROOT = os.environ.get("WORK_ROOT", "/content/whiten-work")
+MODEL_DIR = os.environ.get("MODEL_DIR", "models")
+PAGE_CONCURRENCY = int(os.environ.get("PAGE_CONCURRENCY", "1") or 1)
+# cli = manga-translator-ui على Colab (GPU) | builtin = المحرك المدمج (CPU) على أي سيرفر عادي
+WORKER_ENGINE = (
+    os.environ.get("WORKER_ENGINE") or ("cli" if os.path.isdir(TRANSLATOR_REPO) else "builtin")
+).strip().lower()
 
 app = FastAPI(title="whiten-worker")
 # GPU واحد: فصل واحد في نفس الوقت
@@ -28,7 +33,7 @@ _gpu_lock = asyncio.Lock()
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True}
+    return {"ok": True, "engine": WORKER_ENGINE}
 
 
 @app.post("/clean")
@@ -47,13 +52,24 @@ async def clean(
     payload = await file.read()
     async with _gpu_lock:
         try:
-            cleaned = await clean_chapter_cli(
-                payload,
-                profile=profile,
-                repo_dir=TRANSLATOR_REPO,
-                python_exe=sys.executable,
-                work_root=WORK_ROOT,
-            )
-        except (CliCleanError, ValueError) as exc:
+            if WORKER_ENGINE == "builtin":
+                from local_cleaner import LocalCleanError, clean_chapter_local
+
+                cleaned = await clean_chapter_local(
+                    payload, profile=profile, model_dir=MODEL_DIR, concurrency=PAGE_CONCURRENCY
+                )
+            else:
+                from cli_cleaner import CliCleanError, clean_chapter_cli
+
+                cleaned = await clean_chapter_cli(
+                    payload,
+                    profile=profile,
+                    repo_dir=TRANSLATOR_REPO,
+                    python_exe=sys.executable,
+                    work_root=WORK_ROOT,
+                )
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)[:500]) from exc
+        except RuntimeError as exc:  # LocalCleanError و CliCleanError كلهم RuntimeError
             raise HTTPException(422, detail=str(exc)[:500]) from exc
     return Response(content=cleaned, media_type="application/zip")

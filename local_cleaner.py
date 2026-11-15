@@ -88,6 +88,8 @@ def _env_float(name: str, default: float) -> float:
 CPU_THREADS = max(1, int(_env_float("CV_THREADS", _cpu_limit())))
 cv2.setNumThreads(CPU_THREADS)
 # طول الـ tile في الصفحات الطويلة كنسبة من العرض. أكبر = أسرع (tiles أقل) وأقل دقة قليلاً. 1 = الأدق
+# المحرك: auto (onnxruntime لو الرامات 2GB+، وإلا cv2.dnn الأخف)، أو ort، أو cv2
+DETECTOR = (os.getenv("DETECTOR") or "auto").strip().lower()
 TILE_RATIO = min(2.0, max(1.0, _env_float("TILE_RATIO", 1.5)))
 
 # إعدادات البروفايلات للمحرك المدمج
@@ -152,6 +154,11 @@ def _get_ort(model_path: Path):
         return _ort_session
     with _ort_lock:
         if _ort_session is None and not _ort_failed:
+            limit = _mem_limit_mb()
+            if DETECTOR == "cv2" or (DETECTOR == "auto" and limit is not None and limit < 2048):
+                _ort_failed = True
+                log.info("Detector: cv2.dnn (low-memory mode, mem_limit=%sMB, DETECTOR=%s)", limit or "?", DETECTOR)
+                return None
             try:
                 import onnxruntime as ort  # type: ignore
 
