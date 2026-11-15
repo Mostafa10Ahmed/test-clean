@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    MALLOC_ARENA_MAX=2 \
+    OMP_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2 \
+    WORKER_MODE=1 \
+    PORT=7860 \
+    MODEL_DIR=/tmp/models \
+    WORK_ROOT=/tmp/whiten-work
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+EXPOSE 7860
+CMD ["python", "start.py"]
