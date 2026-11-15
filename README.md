@@ -60,14 +60,18 @@ python bot.py
 
 ## خدمة worker منفصلة (اختياري)
 
-البوت بيفضل خفيف، والتبييض بيتعمل في خدمة تانية. فايدتها الحقيقية إن الـ worker لو وقع من الرامات البوت مبيقعش ولا الطابور بيضيع. ولازم الـ worker يكون على سيرفر **رامات أكتر**، وإلا مفيش فرق.
+البوت بيفضل خفيف، والتبييض بيتعمل في خدمة تانية. فايدتها إن الـ worker لو وقع من الرامات البوت مبيقعش ولا الطابور بيضيع. ولازم الـ worker يكون على سيرفر **رامات أكتر**، وإلا مفيش فرق.
 
 1. في نفس الريبو اعمل خدمة تانية على Railway (**New ← GitHub Repo** لنفس الريبو).
-2. Settings ← **Config as Code** ← الـ path = `/railway.worker.json`.
-3. Variables للـ worker: `WORKER_TOKEN` (قيمة طويلة عشوائية) و`WORKER_ENGINE=builtin` و`MODEL_DIR=/data/models` و`MALLOC_ARENA_MAX=2`، وحط Volume على `/data`.
-4. Settings ← Networking ← **Generate Domain**.
-5. في خدمة البوت: `WORKER_URL=https://<دومين الـ worker>` و`WORKER_TOKEN` بنفس القيمة، و`CLEAN_ENGINE=remote`.
-6. اختبر: افتح `https://<الدومين>/health`، لازم يرجع `{"ok":true,"engine":"builtin"}`.
+2. Variables للـ worker **بس** (من غير `DISCORD_TOKEN`):
+   - `WORKER_MODE=1` ← بيخلي الخدمة تشغّل سيرفر التبييض بدل البوت
+   - `WORKER_TOKEN` = قيمة طويلة عشوائية
+   - `WORKER_ENGINE=builtin`
+   - `MODEL_DIR=/data/models` + Volume على `/data`
+   - `MALLOC_ARENA_MAX=2`
+3. Settings ← Networking ← **Generate Domain**.
+4. في خدمة البوت: `CLEAN_ENGINE=remote` و`WORKER_URL=https://<دومين الـ worker>` و`WORKER_TOKEN` بنفس القيمة.
+5. اختبر: افتح `https://<الدومين>/health`، لازم يرجع `{"ok":true,"engine":"builtin"}`.
 
 ## الأوامر
 
