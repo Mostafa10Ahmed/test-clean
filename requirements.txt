@@ -4,6 +4,7 @@ python-dotenv>=1.0
 # محرك التبييض المدمج
 opencv-python-headless>=4.8
 numpy>=1.26
+onnxruntime>=1.17
 Pillow>=10.0
 # اختياري: جودة أعلى للكلام اللي فوق الرسومات (بروفايل perfect). تقيلة (torch)
 # simple-lama-inpainting>=0.1.2

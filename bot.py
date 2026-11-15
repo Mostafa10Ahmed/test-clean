@@ -35,6 +35,7 @@ GUILD_ID = _env_int("DISCORD_GUILD_ID", 0)  # 0 = sync global (أبطأ في ا�
 ADMIN_ROLE_ID = _env_int("ADMIN_ROLE_ID", 0)
 ALLOWED_CHANNEL_IDS = {int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").replace(" ", "").split(",") if x}
 GOFILE_TOKEN = os.getenv("GOFILE_TOKEN") or None
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or None  # لتحميل فولدرات Google Drive
 WORKER_URL = os.getenv("WORKER_URL") or None
 WORKER_TOKEN = os.getenv("WORKER_TOKEN") or None
 TRANSLATOR_REPO = os.getenv("TRANSLATOR_REPO", "/root/manga-translator-ui")  # فولدر manga-translator-ui
@@ -46,7 +47,7 @@ WORK_ROOT = os.getenv("WORK_ROOT", "/root/whiten-work")  # فولدر مؤقت �
 #   cli     = يشغّل manga-translator-ui متسطّب على نفس الجهاز
 CLEAN_ENGINE = (os.getenv("CLEAN_ENGINE") or ("remote" if WORKER_URL else "builtin")).strip().lower()
 MODEL_DIR = os.getenv("MODEL_DIR", "models")
-PAGE_CONCURRENCY = _env_int("PAGE_CONCURRENCY", 2)
+PAGE_CONCURRENCY = _env_int("PAGE_CONCURRENCY", 1)
 QUEUE_WORKERS = _env_int("QUEUE_WORKERS", 1)  # 1 مناسب للـ GPU الواحد
 MAX_PENDING = _env_int("MAX_PENDING", 20)
 MAX_UPLOAD_MB = _env_int("MAX_UPLOAD_MB", 25)  # حد الديسكورد للملفات العادية
@@ -198,6 +199,7 @@ async def clean_command(
                 link,
                 max_bytes=MAX_DOWNLOAD_MB * 1024 * 1024,
                 gofile_token=GOFILE_TOKEN,
+                drive_api_key=GOOGLE_API_KEY,
             )
     except (SourceError, aiohttp.ClientError) as exc:
         await interaction.followup.send(f"❌ {exc}", ephemeral=True)

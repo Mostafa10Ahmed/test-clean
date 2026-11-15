@@ -13,6 +13,8 @@ import asyncio
 import hashlib
 import io
 import logging
+import math
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +34,61 @@ MODEL_URL = "https://github.com/zyddnys/manga-image-translator/releases/download
 MODEL_FILE = "comictextdetector.pt.onnx"
 MODEL_SHA256 = "1a86ace74961413cbd650002e7bb4dcec4980ffa21b2f19b86933372071d718f"
 INPUT_SIZE = 1024  # الموديل متصدّر بمدخل ثابت 1024x1024
+
+
+def _cpu_limit() -> int:
+    """عدد الأنوية المتاحة فعلاً للحاوية (مش عدد أنوية الجهاز الفعلي)."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n = os.cpu_count() or 1
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, math.ceil(int(quota) / int(period))))
+    except Exception:
+        try:
+            quota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+            period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+            if quota > 0:
+                n = min(n, max(1, math.ceil(quota / period)))
+        except Exception:
+            pass
+    return max(1, n)
+
+
+def _mem_limit_mb() -> int | None:
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = open(path).read().strip()
+            if raw.isdigit() and int(raw) < 1 << 50:
+                return int(raw) // (1024 * 1024)
+        except Exception:
+            continue
+    return None
+
+
+def _rss_mb() -> int:
+    """الرامات الحالية للعملية (MB)."""
+    try:
+        with open("/proc/self/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+# عدد threads الحساب. الافتراضي = أنوية الحاوية (أهم نقطة للسرعة)، وممكن تتغيّر بـ CV_THREADS
+CPU_THREADS = max(1, int(_env_float("CV_THREADS", _cpu_limit())))
+cv2.setNumThreads(CPU_THREADS)
+# طول الـ tile في الصفحات الطويلة كنسبة من العرض. أكبر = أسرع (tiles أقل) وأقل دقة قليلاً. 1 = الأدق
+TILE_RATIO = min(2.0, max(1.0, _env_float("TILE_RATIO", 1.5)))
 
 # إعدادات البروفايلات للمحرك المدمج
 _SETTINGS = {
@@ -81,6 +138,35 @@ async def ensure_model(model_dir: str) -> Path:
 
 # ---------- الكشف ----------
 _thread_state = threading.local()
+_ort_session = None
+_ort_failed = False
+_ort_lock = threading.Lock()
+
+
+def _get_ort(model_path: Path):
+    """onnxruntime أسرع وأخف في الرامات من cv2.dnn. لو مش متسطّب أو فشل بنرجع لـ cv2.dnn."""
+    global _ort_session, _ort_failed
+    if _ort_failed:
+        return None
+    if _ort_session is not None:
+        return _ort_session
+    with _ort_lock:
+        if _ort_session is None and not _ort_failed:
+            try:
+                import onnxruntime as ort  # type: ignore
+
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = CPU_THREADS
+                opts.inter_op_num_threads = 1
+                opts.enable_cpu_mem_arena = False  # بيرجّع الرامات بدل ما يحجزها
+                _ort_session = ort.InferenceSession(
+                    str(model_path), sess_options=opts, providers=["CPUExecutionProvider"]
+                )
+                log.info("Detector: onnxruntime (%d threads)", CPU_THREADS)
+            except Exception as exc:
+                _ort_failed = True
+                log.info("onnxruntime not used (%s); falling back to cv2.dnn", exc)
+        return _ort_session
 
 
 def _get_net(model_path: Path) -> "cv2.dnn.Net":
@@ -93,6 +179,21 @@ def _get_net(model_path: Path) -> "cv2.dnn.Net":
     return net
 
 
+def _run_detector(canvas: np.ndarray, model_path: Path) -> list:
+    global _ort_failed
+    sess = _get_ort(model_path)
+    if sess is not None:
+        try:
+            blob = np.ascontiguousarray(canvas.transpose(2, 0, 1)[None], dtype=np.float32) / 255.0
+            return list(sess.run(None, {sess.get_inputs()[0].name: blob}))
+        except Exception as exc:
+            _ort_failed = True
+            log.warning("onnxruntime failed (%s); falling back to cv2.dnn", exc)
+    net = _get_net(model_path)
+    net.setInput(cv2.dnn.blobFromImage(canvas, scalefactor=1 / 255.0))
+    return list(net.forward(_thread_state.outputs))
+
+
 def _detect_tile(rgb: np.ndarray, model_path: Path) -> np.ndarray:
     """احتمالية وجود كلام لكل بكسل (float32 بنفس حجم الـ tile)."""
     h, w = rgb.shape[:2]
@@ -102,9 +203,7 @@ def _detect_tile(rgb: np.ndarray, model_path: Path) -> np.ndarray:
     canvas = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
     canvas[:nh, :nw] = resized  # padding تحت وعلى اليمين زي letterbox بتاع CTD
 
-    net = _get_net(model_path)
-    net.setInput(cv2.dnn.blobFromImage(canvas, scalefactor=1 / 255.0))
-    outputs = net.forward(_thread_state.outputs)
+    outputs = _run_detector(canvas, model_path)
     # مخرجات CTD: blocks و seg mask (1x1xHxW) و lines map. بناخد الـ seg mask بالشكل
     seg = next(
         (o for o in outputs if o.ndim == 4 and o.shape[1] == 1 and o.shape[2] == INPUT_SIZE),
@@ -130,13 +229,13 @@ def detect_text_mask(rgb: np.ndarray, model_path: Path, thresh: float) -> np.nda
     h, w = rgb.shape[:2]
     prob = np.zeros((h, w), dtype=np.float32)
     if h > w * 1.5:
-        side = w
-        for y in _tiles(h, side, side // 8):
+        side = max(w, int(w * TILE_RATIO))
+        for y in _tiles(h, side, w // 8):
             part = _detect_tile(rgb[y:y + side], model_path)
             np.maximum(prob[y:y + side], part, out=prob[y:y + side])
     elif w > h * 1.5:
-        side = h
-        for x in _tiles(w, side, side // 8):
+        side = max(h, int(h * TILE_RATIO))
+        for x in _tiles(w, side, h // 8):
             part = _detect_tile(rgb[:, x:x + side], model_path)
             np.maximum(prob[:, x:x + side], part, out=prob[:, x:x + side])
     else:
@@ -244,19 +343,30 @@ async def clean_chapter_local(
     total = len(pages)
     started = time.monotonic()
     done = 0
-    log.info("Whitening %d pages (profile=%s, concurrency=%d)", total, profile, concurrency)
+    log.info(
+        "Whitening %d pages (profile=%s, page_concurrency=%d, cpu_threads=%d, mem_limit=%sMB)",
+        total, profile, concurrency, CPU_THREADS, _mem_limit_mb() or "?",
+    )
+    results: list = [b""] * total
+    gate = asyncio.Semaphore(max(1, concurrency))
     with ThreadPoolExecutor(max_workers=max(1, concurrency), thread_name_prefix="whiten") as pool:
-        async def run(name: str, data: bytes) -> bytes:
+        async def run(index: int) -> None:
             nonlocal done
-            try:
-                result = await loop.run_in_executor(pool, clean_page_bytes, data, model_path, profile)
-            except Exception as exc:
-                raise LocalCleanError(f"Failed to whiten page `{name}`: {exc}") from exc
+            async with gate:
+                name, data = pages[index]
+                pages[index] = (name, b"")  # نحرّر الصورة الأصلية من الذاكرة أول ما تتعالج
+                try:
+                    results[index] = await loop.run_in_executor(pool, clean_page_bytes, data, model_path, profile)
+                except Exception as exc:
+                    raise LocalCleanError(f"Failed to whiten page `{name}`: {exc}") from exc
+                del data
             done += 1
-            log.info("Page %d/%d done (%s) - %.0fs elapsed", done, total, name, time.monotonic() - started)
-            return result
+            log.info(
+                "Page %d/%d done (%s) - %.0fs elapsed, rss=%dMB",
+                done, total, name, time.monotonic() - started, _rss_mb(),
+            )
 
-        results = await asyncio.gather(*(run(name, data) for name, data in pages))
+        await asyncio.gather(*(run(i) for i in range(total)))
     return build_zip(list(zip(names, results)))
 
 
