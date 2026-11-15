@@ -1,10 +1,10 @@
-"""محرك التبييض المدمج السريع (Turbo CPU Engine):
+"""محرك التبييض المدمج السريع والمستقر (Turbo CPU Engine v3):
 
-تحسينات السرعة والرامات:
-1. دمج شريحتين (2 Tiles) جنباً إلى جنب في استدعاء ONNX واحد بحجم 1024x1024 (مما يضاعف سرعة الكشف للويبتون الطويل).
-2. تخطي الفراغات البيضاء/السوداء (Gutters) بين البانلات تلقائياً في أقل من 2ms بدون تشغيل الشبكة العصبية عليها.
-3. تفعيل تحسينات `onnxruntime` الكاملة (`ORT_ENABLE_ALL`) مع استغلال الأنوية المتاحة.
-4. معالجة الفصل صفحة بصفحة مباشرة على الهارد مع تحرير الرامات (`malloc_trim`) وحفظ سريع بنفس امتداد الصورة الأصلية (`.jpg`/`.webp`/`.png`).
+يدعم بروفايل `fast` و `perfect` بثبات كامل على حاويات Railway المحدودة (953MB RAM):
+1. دمج شريحتين (Dual-Tile Packing) في استدعاء ONNX واحد مع حساب مخرج الـ seg mask فقط لتوفير الرامات والوقت.
+2. تخطي الفراغات السادة (Gutters) بين بانلات الويبتون تلقائياً في أقل من 2ms.
+3. منع استدعاء `np.where` ذو الـ 64-bit وتحديد `BAND_PIXELS=4_800_000` بحيث لا يتخطى استهلاك الرامات ~240MB حتى في بروفايل `perfect`.
+4. في بروفايل `perfect`: دقة كشف أعلى للحروف الصغيرة، وتنعيم حواف المسح (Feathering + Multi-pass Inpaint) بدون انهيار الرامات.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ log = logging.getLogger("whiten-bot.local")
 MODEL_URL = "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/comictextdetector.pt.onnx"
 MODEL_FILE = "comictextdetector.pt.onnx"
 MODEL_SHA256 = "1a86ace74961413cbd650002e7bb4dcec4980ffa21b2f19b86933372071d718f"
-INPUT_SIZE = 1024  # الموديل متصدّر بمدخل ثابت 1024x1024
+INPUT_SIZE = 1024
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -45,34 +45,13 @@ except Exception:
 
 
 def _release_memory() -> None:
-    """إجبار Python و Linux glibc على تحرير الرامات فوراً بعد كل صفحة طويلة لمنع OOM 502."""
+    """إجبار Python و Linux glibc على تحرير الرامات فوراً بعد كل صفحة أو شريط لمنع OOM."""
     gc.collect()
     if _libc is not None:
         try:
             _libc.malloc_trim(0)
         except Exception:
             pass
-
-
-def _cpu_limit() -> int:
-    """عدد الأنوية المتاحة للحاوية (بين 2 و 6 افتراضياً لأقصى سرعة بدون تضخم الرامات)."""
-    try:
-        n = len(os.sched_getaffinity(0))
-    except AttributeError:
-        n = os.cpu_count() or 4
-    try:
-        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
-        if quota != "max":
-            n = min(n, max(1, math.ceil(int(quota) / int(period))))
-    except Exception:
-        try:
-            quota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
-            period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
-            if quota > 0:
-                n = min(n, max(1, math.ceil(quota / period)))
-        except Exception:
-            pass
-    return max(2, min(n, 6))
 
 
 def _mem_limit_mb() -> int | None:
@@ -86,8 +65,30 @@ def _mem_limit_mb() -> int | None:
     return None
 
 
+def _cpu_limit() -> int:
+    try:
+        n = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n = os.cpu_count() or 3
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, math.ceil(int(quota) / int(period))))
+    except Exception:
+        try:
+            quota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+            period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+            if quota > 0:
+                n = min(n, max(1, math.ceil(quota / period)))
+        except Exception:
+            pass
+    mem = _mem_limit_mb()
+    # لو الرامات أقل من 1200MB (مثل Railway 953MB)، 3 أنوية تعطي سرعة عالية جداً بدون قفزات رامات
+    max_safe = 3 if (mem is not None and mem < 1200) else 4
+    return max(2, min(n, max_safe))
+
+
 def _rss_mb() -> int:
-    """الرامات الحالية للعملية (MB)."""
     try:
         with open("/proc/self/statm") as fh:
             return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
@@ -102,23 +103,36 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# عدد threads الحساب (4-6 أنوية يعطي أقصى سرعة لـ ONNXRuntime و OpenCV)
 CPU_THREADS = max(1, int(_env_float("CV_THREADS", _cpu_limit())))
 cv2.setNumThreads(CPU_THREADS)
-# المحرك: ort (الأسرع بـ 3.5x على CPU) هو الافتراضي دائماً إلا لو طلب المستخدم cv2 صراحةً
 DETECTOR = (os.getenv("DETECTOR") or "ort").strip().lower()
-# معالجة الصفحات حتى 16 مليون بكسل (مثلاً 800x20000) في شوط واحد بدون تقطيع مكرر
-BAND_PIXELS = int(_env_float("BAND_PIXELS", 16_000_000))
+# 4.8 مليون بكسل لكل شريط (حوالي 800x6000 بكسل) يحافظ على الرامات تحت 250MB دائماً حتى في perfect
+BAND_PIXELS = int(_env_float("BAND_PIXELS", 4_800_000))
 BAND_MARGIN = 128
-# عند دمج شريحتين (Dual-Tile Packing) في لوحة 1024x1024، كل شريحة تأخذ عرض <= 502 بكسل وطول ~2.04x من العرض
 TILE_RATIO = min(2.2, max(1.2, _env_float("TILE_RATIO", 2.04)))
 DUAL_TILE_PACKING = os.getenv("DUAL_TILE_PACKING", "1").strip().lower() not in ("0", "false", "no")
-# صيغة الخرج: auto (يحفظ الصور بنفس امتدادها الأصلي jpg/webp/png لسرعة حفظ فائقة وحجم ملف أصغر بـ 5x) | png | jpg
 OUTPUT_FORMAT = (os.getenv("OUTPUT_FORMAT") or "auto").strip().lower()
 
+# إعدادات البروفايلات:
+# perfect: حساسية أعلى للكشف (0.30)، توسيع mask أكبر (5) لمسح الحواف والظلال تماماً، وتنعيم متعدد المراحل
+# fast:    أسرع (0.35)، توسيع (4)، ومسح سريع بخطوة واحدة
 _SETTINGS = {
-    "perfect": {"mask_thresh": 0.3, "dilate": 5, "use_lama": True},
-    "fast": {"mask_thresh": 0.35, "dilate": 4, "use_lama": False},
+    "perfect": {
+        "mask_thresh": 0.30,
+        "dilate": 5,
+        "inpaint_radius": 4,
+        "feather": True,
+        "use_lama": True,
+        "tile_overlap_div": 8,
+    },
+    "fast": {
+        "mask_thresh": 0.35,
+        "dilate": 4,
+        "inpaint_radius": 3,
+        "feather": False,
+        "use_lama": False,
+        "tile_overlap_div": 10,
+    },
 }
 
 
@@ -126,7 +140,6 @@ class LocalCleanError(RuntimeError):
     pass
 
 
-# ---------- تحميل الموديل ----------
 _download_lock = asyncio.Lock()
 
 
@@ -164,13 +177,15 @@ async def ensure_model(model_dir: str) -> Path:
 # ---------- الكشف السريع ----------
 _thread_state = threading.local()
 _ort_session = None
+_ort_input_name = None
+_ort_seg_name = None
 _ort_failed = False
 _ort_lock = threading.Lock()
 
 
 def _get_ort(model_path: Path):
-    """onnxruntime أسرع بـ 3-4 أضعاف من cv2.dnn على المعالج."""
-    global _ort_session, _ort_failed
+    """onnxruntime مع إيقاف mem_pattern و cpu_mem_arena لمنع أي قفزة رامات على Railway."""
+    global _ort_session, _ort_input_name, _ort_seg_name, _ort_failed
     if _ort_failed:
         return None
     if _ort_session is not None:
@@ -189,11 +204,21 @@ def _get_ort(model_path: Path):
                 opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 opts.intra_op_num_threads = CPU_THREADS
                 opts.inter_op_num_threads = 1
-                opts.enable_cpu_mem_arena = False  # يمنع حجز رامات دائمة مع الحفاظ على سرعة الـ kernels
-                _ort_session = ort.InferenceSession(
-                    str(model_path), sess_options=opts, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-                )
-                log.info("Detector: onnxruntime turbo (%d threads)", CPU_THREADS)
+                opts.enable_cpu_mem_arena = False
+                opts.enable_mem_pattern = False
+
+                avail = set(ort.get_available_providers())
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in avail else ["CPUExecutionProvider"]
+                sess = ort.InferenceSession(str(model_path), sess_options=opts, providers=providers)
+                _ort_input_name = sess.get_inputs()[0].name
+                # نحدد اسم مخرج الـ seg mask فقط (1x1x1024x1024) عشان منحسبش باقي المخرجات غير المستخدمة
+                for out_meta in sess.get_outputs():
+                    shape = out_meta.shape
+                    if len(shape) == 4 and shape[1] == 1:
+                        _ort_seg_name = out_meta.name
+                        break
+                _ort_session = sess
+                log.info("Detector: onnxruntime turbo (%d threads, seg_out=%s)", CPU_THREADS, _ort_seg_name or "all")
             except Exception as exc:
                 _ort_failed = True
                 log.info("onnxruntime not used (%s); falling back to cv2.dnn", exc)
@@ -210,21 +235,24 @@ def _get_net(model_path: Path) -> "cv2.dnn.Net":
 
 
 def _run_detector_seg(canvas: np.ndarray, model_path: Path) -> np.ndarray:
-    """يشغّل الموديل على لوحة 1024x1024 ويرجع مصفوفة الاحتمالات (1024x1024 float32) فقط لتوفير الوقت."""
+    """يشغّل الموديل على لوحة 1024x1024 ويرجع مصفوفة الاحتمالات (1024x1024 float32) فقط."""
     global _ort_failed
     sess = _get_ort(model_path)
     if sess is not None:
         try:
             blob = np.ascontiguousarray(canvas.transpose(2, 0, 1)[None], dtype=np.float32)
             blob *= (1.0 / 255.0)
-            outputs = sess.run(None, {sess.get_inputs()[0].name: blob})
+            out_names = [_ort_seg_name] if _ort_seg_name else None
+            outputs = sess.run(out_names, {_ort_input_name: blob})
             del blob
             seg = next(
                 (o for o in outputs if o.ndim == 4 and o.shape[1] == 1 and o.shape[2] == INPUT_SIZE),
                 None,
             )
             if seg is not None:
-                return seg[0, 0]
+                res = seg[0, 0].copy()
+                del outputs, seg
+                return res
         except Exception as exc:
             _ort_failed = True
             log.warning("onnxruntime failed (%s); falling back to cv2.dnn", exc)
@@ -240,19 +268,19 @@ def _run_detector_seg(canvas: np.ndarray, model_path: Path) -> np.ndarray:
     )
     if seg is None:
         raise LocalCleanError(f"unexpected detector outputs: {[o.shape for o in outputs]}")
-    return seg[0, 0]
+    res = seg[0, 0].copy()
+    del outputs, seg
+    return res
 
 
 def _tile_has_contrast(tile: np.ndarray) -> bool:
-    """فحص سريع جداً (< 0.3ms) لمعرفة ما إذا كانت الشريحة تحتوي على أي حواف/نصوص أم أنها فراغ سادة."""
     sub = tile[::4, ::4]
     if sub.size == 0:
         return False
-    if int(sub.max()) - int(sub.min()) < 22:
+    if int(sub.max()) - int(sub.min()) < 20:
         return False
-    # فحص التباين الأفقي السريع (النصوص تحتوي دائماً على تغيرات حادة بين البكسلات المتجاورة)
     diff = cv2.absdiff(sub[:, 1:], sub[:, :-1])
-    return int(diff.max()) >= 22
+    return int(diff.max()) >= 20
 
 
 def _detect_single_tile(rgb: np.ndarray, model_path: Path) -> np.ndarray:
@@ -269,13 +297,13 @@ def _detect_single_tile(rgb: np.ndarray, model_path: Path) -> np.ndarray:
     seg = _run_detector_seg(canvas, model_path)
     del canvas
     prob = seg[:nh, :nw].astype(np.float32)
+    del seg
     return cv2.resize(prob, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 def _detect_dual_tiles(tile1: np.ndarray, tile2: np.ndarray, model_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """يدمج شريحتين رأسيتين جنباً إلى جنب في لوحة 1024x1024 واحدة لمضاعفة سرعة الـ CPU."""
     MAX_HALF_W = 500
-    GAP = 24  # فاصل أسود بين الشريحتين لمنع تداخل الكشف
+    GAP = 24
 
     h1, w1 = tile1.shape[:2]
     scale1 = min(INPUT_SIZE / max(1, h1), MAX_HALF_W / max(1, w1))
@@ -295,27 +323,25 @@ def _detect_dual_tiles(tile1: np.ndarray, tile2: np.ndarray, model_path: Path) -
 
     prob1 = cv2.resize(seg[:nh1, :nw1].astype(np.float32), (w1, h1), interpolation=cv2.INTER_LINEAR)
     prob2 = cv2.resize(seg[:nh2, x2:x2 + nw2].astype(np.float32), (w2, h2), interpolation=cv2.INTER_LINEAR)
+    del seg
     return prob1, prob2
 
 
 def _smart_vertical_tiles(rgb: np.ndarray, side: int, overlap: int) -> list[tuple[int, int]]:
-    """يبني إحداثيات الشرائح الرأسية مع تخطي الفراغات السادة (Gutters) بين بانلات الويبتون."""
     h, w = rgb.shape[:2]
     if h <= side:
-        return [(0, h)]
+        return [(0, h)] if _tile_has_contrast(rgb) else []
 
-    # فحص سريع جداً للصفوف النشطة على نسخة مصغرة بـ uint8
     sub = rgb[::4, ::8]
     if sub.shape[1] > 1:
         row_diff = cv2.absdiff(sub[:, 1:], sub[:, :-1]).max(axis=(1, 2))
-        active_sub = row_diff >= 18
+        active_sub = row_diff >= 16
     else:
         active_sub = np.ones(sub.shape[0], dtype=bool)
 
     tiles: list[tuple[int, int]] = []
     y = 0
     while y < h:
-        # تخطي الصفوف الفارغة (بيضاء أو سوداء سادة)
         while y < h and not active_sub[min(y // 4, len(active_sub) - 1)]:
             y += 4
         if y >= h:
@@ -342,14 +368,13 @@ def _tiles(length: int, tile: int, overlap: int) -> list[int]:
     return starts
 
 
-def detect_text_mask(rgb: np.ndarray, model_path: Path, thresh: float) -> np.ndarray:
-    """mask (0/255) لمكان الكلام بسرعة مضاعفة للصفحات الطويلة."""
+def detect_text_mask(rgb: np.ndarray, model_path: Path, thresh: float, overlap_div: int = 10) -> np.ndarray:
     h, w = rgb.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
 
     if h > w * 1.5:
         side = max(w, int(w * TILE_RATIO))
-        overlap = max(48, w // 10)
+        overlap = max(48, w // overlap_div)
         spans = _smart_vertical_tiles(rgb, side, overlap)
         if not spans:
             return mask
@@ -382,7 +407,7 @@ def detect_text_mask(rgb: np.ndarray, model_path: Path, thresh: float) -> np.nda
 
     if w > h * 1.5:
         side = max(h, int(h * TILE_RATIO))
-        for x in _tiles(w, side, h // 10):
+        for x in _tiles(w, side, h // overlap_div):
             p = _detect_single_tile(rgb[:, x:x + side], model_path)
             m = (p > thresh).astype(np.uint8) * 255
             np.maximum(mask[:, x:x + side], m, out=mask[:, x:x + side])
@@ -406,17 +431,29 @@ def _get_lama():
     with _lama_lock:
         if not _lama_checked:
             _lama_checked = True
+            mem = _mem_limit_mb()
+            # موديل LaMa يحتاج PyTorch ورامات >= 2GB؛ على الحاويات الصغيرة نستخدم محرك OpenCV المحسن
+            if mem is not None and mem < 2048:
+                log.info("Container mem_limit=%dMB (<2048MB); using enhanced OpenCV inpainting for perfect profile", mem)
+                return None
             try:
                 from simple_lama_inpainting import SimpleLama  # type: ignore
 
                 _lama = SimpleLama()
                 log.info("LaMa inpainting enabled")
             except Exception as exc:
-                log.info("LaMa not available (%s); using OpenCV inpainting", exc)
+                log.info("LaMa not available (%s); using enhanced OpenCV inpainting", exc)
         return _lama
 
 
-def _inpaint_region(rgb: np.ndarray, mask: np.ndarray, use_lama: bool) -> np.ndarray:
+def _inpaint_region(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    *,
+    use_lama: bool,
+    radius: int = 3,
+    feather: bool = False,
+) -> np.ndarray:
     lama = _get_lama() if use_lama else None
     if lama is not None:
         with _lama_lock:
@@ -425,19 +462,32 @@ def _inpaint_region(rgb: np.ndarray, mask: np.ndarray, use_lama: bool) -> np.nda
         result = rgb.copy()
         result[mask > 0] = out[mask > 0]
         return result
-    return cv2.inpaint(rgb, mask, 3, cv2.INPAINT_TELEA)
+
+    # لو البروفايل perfect (feather=True): ندمج TELEA مع تنعيم خفيف على الحواف عشان ميبقاش فيه أثر مكان المسح
+    inpainted = cv2.inpaint(rgb, mask, radius, cv2.INPAINT_TELEA)
+    if feather:
+        blur = cv2.GaussianBlur(inpainted, (3, 3), 0)
+        inner = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        inpainted[inner > 0] = blur[inner > 0]
+    return inpainted
 
 
 def clean_image(rgb: np.ndarray, model_path: Path, profile: str) -> np.ndarray:
     settings = _SETTINGS[profile]
-    raw = detect_text_mask(rgb, model_path, settings["mask_thresh"])
+    raw = detect_text_mask(
+        rgb,
+        model_path,
+        settings["mask_thresh"],
+        overlap_div=settings["tile_overlap_div"],
+    )
     if not raw.any():
         return rgb
 
     k = settings["dilate"]
     mask = cv2.dilate(raw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
     del raw
-    groups = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+    # تجميع الحروف القريبة في جملة واحدة (11x11 بدلاً من 15x15 لمنع اندماج فقاعات متباعدة في مستطيل عملاق)
+    groups = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
     count, labels, stats, _ = cv2.connectedComponentsWithStats(groups, connectivity=8)
     del groups
 
@@ -446,14 +496,22 @@ def clean_image(rgb: np.ndarray, model_path: Path, profile: str) -> np.ndarray:
     ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     for label in range(1, count):
         x, y, bw, bh, area = stats[label]
-        if area < 12:
+        if area < 10:
             continue
         pad = 20
         x0, y0 = max(0, x - pad), max(0, y - pad)
         x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
-        region_mask = np.where((labels[y0:y1, x0:x1] == label) & (mask[y0:y1, x0:x1] > 0), 255, 0).astype(np.uint8)
-        if not region_mask.any():
+
+        # بناء region_mask بـ uint8 مباشرة (1 بايت لكل بكسل بدلاً من 8 بايت في np.where)
+        sub_labels = labels[y0:y1, x0:x1]
+        sub_mask = mask[y0:y1, x0:x1]
+        cond = (sub_labels == label) & (sub_mask > 0)
+        if not cond.any():
             continue
+        region_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        region_mask[cond] = 255
+        del cond
+
         crop = out[y0:y1, x0:x1]
 
         ring = cv2.dilate(region_mask, ring_kernel) > 0
@@ -461,18 +519,30 @@ def clean_image(rgb: np.ndarray, model_path: Path, profile: str) -> np.ndarray:
         ring_pixels = crop[ring]
         if len(ring_pixels) >= 20:
             spread = np.percentile(ring_pixels, 90, axis=0) - np.percentile(ring_pixels, 10, axis=0)
-            if spread.max() <= 30:
+            # في perfect نتسامح حتى فرق 34 لتعبئة الفقاعات ذات التدرج الخفيف بلون صافي 100%
+            max_spread = 34 if profile == "perfect" else 30
+            if spread.max() <= max_spread:
                 crop[region_mask > 0] = np.median(ring_pixels, axis=0).astype(np.uint8)
+                del region_mask, ring
                 continue
+        del ring
 
-        inpainted = _inpaint_region(crop.copy(), region_mask, settings["use_lama"])
+        inpainted = _inpaint_region(
+            crop.copy(),
+            region_mask,
+            use_lama=settings["use_lama"],
+            radius=settings["inpaint_radius"],
+            feather=settings["feather"],
+        )
         crop[region_mask > 0] = inpainted[region_mask > 0]
-    del mask, labels
+        del region_mask, inpainted
+
+    del mask, labels, stats
     return out
 
 
 def clean_image_banded(rgb: np.ndarray, model_path: Path, profile: str) -> np.ndarray:
-    """بيعالج الصفحة الطويلة جداً على أشرطة لو تخطت BAND_PIXELS."""
+    """يعالج الصفحات الطويلة على أشرطة آمنة في الرامات (حوالي 6000 بكسل طولاً لكل شريط)."""
     h, w = rgb.shape[:2]
     band = max(1024, BAND_PIXELS // max(1, w))
     if h <= band + 2 * BAND_MARGIN:
@@ -503,7 +573,6 @@ def clean_image_banded(rgb: np.ndarray, model_path: Path, profile: str) -> np.nd
 
 
 def clean_page_bytes(data: bytes, model_path: Path, profile: str, orig_ext: str = ".png") -> tuple[str, bytes]:
-    """يرجّع (الامتداد_الفعلي, بايتات_الصورة) مع حفظ سريع بنفس صيغة الصورة الأصلية."""
     bgr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     if bgr is None:
         with Image.open(io.BytesIO(data)) as im:
@@ -513,14 +582,14 @@ def clean_page_bytes(data: bytes, model_path: Path, profile: str, orig_ext: str 
     out = cv2.cvtColor(cleaned, cv2.COLOR_RGB2BGR, dst=cleaned)
 
     orig_lower = orig_ext.lower()
+    jpg_quality = 95 if profile == "perfect" else 93
     if OUTPUT_FORMAT in ("jpg", "jpeg") or (OUTPUT_FORMAT == "auto" and orig_lower in (".jpg", ".jpeg")):
-        ok, encoded = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
+        ok, encoded = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_quality])
         ext = ".jpg"
     elif OUTPUT_FORMAT == "webp" or (OUTPUT_FORMAT == "auto" and orig_lower == ".webp"):
-        ok, encoded = cv2.imencode(".webp", out, [int(cv2.IMWRITE_WEBP_QUALITY), 92])
+        ok, encoded = cv2.imencode(".webp", out, [int(cv2.IMWRITE_WEBP_QUALITY), 94])
         ext = ".webp"
     else:
-        # ضغط PNG سريع (مستوى 1 أسرع بـ 5 أضعاف من الافتراضي)
         ok, encoded = cv2.imencode(".png", out, [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
         ext = ".png"
     del out, cleaned, rgb, bgr
@@ -552,13 +621,13 @@ async def clean_chapter_local_file(
 
     loop = asyncio.get_running_loop()
     started = time.monotonic()
-    workers = max(1, min(concurrency, 2))
     log.info(
-        "Whitening %d pages on disk (profile=%s, page_concurrency=%d, cpu_threads=%d, dual_tile=%s, mem_limit=%sMB)",
-        total, profile, workers, CPU_THREADS, DUAL_TILE_PACKING, _mem_limit_mb() or "?",
+        "Whitening %d pages on disk (profile=%s, cpu_threads=%d, dual_tile=%s, mem_limit=%sMB)",
+        total, profile, CPU_THREADS, DUAL_TILE_PACKING, _mem_limit_mb() or "?",
     )
 
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="whiten") as pool:
+    # max_workers=1 يضمن إعادة استخدام نفس الـ Thread دائماً وعدم فتح أرينات ذاكرة إضافية
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="whiten") as pool:
         with zipfile.ZipFile(in_zip_path, "r") as zf_in, zipfile.ZipFile(
             out_zip_path, "w", compression=zipfile.ZIP_STORED
         ) as zf_out:

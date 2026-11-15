@@ -6,7 +6,7 @@
 import os
 
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
-os.environ.setdefault("OMP_NUM_THREADS", os.getenv("CV_THREADS", "4"))
+os.environ.setdefault("OMP_NUM_THREADS", os.getenv("CV_THREADS", "3"))
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 
