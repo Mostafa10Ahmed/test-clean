@@ -1,8 +1,8 @@
 """سيرفر التبييض (Worker): يشتغل على Railway أو Hugging Face Spaces أو Colab.
 
-يدعم طريقتين:
-1. غير متزامن (Async Polling) عبر `/jobs` لتفادي خطأ Railway HTTP 502 (Application failed to respond) مع الفصول الطويلة والـ stitched.
-2. مباشر عبر `/clean` للتوافق مع الاختبارات والفصول الصغيرة.
+يدعم:
+1. المهام غير المتزامنة عبر `/jobs` مع إمكانية رفع النتيجة مباشرة على GoFile من الووركر نفسه لتوفير نصف وقت الشبكة!
+2. المسار المباشر `/clean` للتوافق مع الاختبارات.
 """
 from __future__ import annotations
 
@@ -20,20 +20,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
+from gofile import upload_to_gofile
 from profiles import PROFILE_CHOICES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("whiten-worker")
 
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+GOFILE_TOKEN = os.environ.get("GOFILE_TOKEN") or None
 TRANSLATOR_REPO = os.environ.get("TRANSLATOR_REPO", "/content/manga-translator-ui")
 WORK_ROOT = os.environ.get("WORK_ROOT", "/tmp/whiten-work")
 MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 PAGE_CONCURRENCY = int(os.environ.get("PAGE_CONCURRENCY", "1") or 1)
-# cli = manga-translator-ui على Colab (GPU) | builtin = المحرك المدمج (CPU) على أي سيرفر عادي
 WORKER_ENGINE = (
     os.environ.get("WORKER_ENGINE") or ("cli" if os.path.isdir(TRANSLATOR_REPO) else "builtin")
 ).strip().lower()
@@ -46,9 +48,13 @@ class WorkerJob:
     work_dir: Path
     in_zip: Path
     out_zip: Path
+    job_name: str = "chapter"
+    upload_gofile: bool = False
+    gofile_token: Optional[str] = None
     status: str = "pending"  # pending | running | done | failed
     done_pages: int = 0
     total_pages: int = 0
+    result_url: Optional[str] = None
     error: Optional[str] = None
     created_at: float = field(default_factory=time.monotonic)
 
@@ -132,14 +138,33 @@ async def _run_worker_job(job: WorkerJob) -> None:
                 payload = job.in_zip.read_bytes()
                 cleaned = await clean_chapter_cli(
                     payload,
-                    profile=job.profile,
+                    profile=profile,
                     repo_dir=TRANSLATOR_REPO,
                     python_exe=sys.executable,
                     work_root=WORK_ROOT,
                 )
                 job.out_zip.write_bytes(cleaned)
                 del payload, cleaned
+
             job.in_zip.unlink(missing_ok=True)
+
+            # لو البوت طلب رفع الملف مباشرة لـ GoFile من الووركر نوفر خطوة التحميل للبوت بالكامل
+            if job.upload_gofile:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        out_bytes = job.out_zip.read_bytes()
+                        job.result_url = await upload_to_gofile(
+                            session,
+                            out_bytes,
+                            f"{job.job_name}-clean.zip",
+                            token=job.gofile_token or GOFILE_TOKEN,
+                        )
+                        del out_bytes
+                        job.out_zip.unlink(missing_ok=True)
+                        log.info("Worker uploaded job %s directly to GoFile: %s", job.job_id, job.result_url)
+                except Exception as up_exc:
+                    log.warning("Direct GoFile upload from worker failed (%s); bot will download zip instead", up_exc)
+
             job.status = "done"
         except Exception as exc:
             log.exception("Worker job %s failed", job.job_id)
@@ -157,9 +182,11 @@ async def health() -> dict:
 async def create_job(
     file: UploadFile = File(...),
     profile: str = Form("fast"),
+    job_name: str = Form("chapter"),
+    upload_gofile: str = Form("0"),
+    gofile_token: str = Form(""),
     x_worker_token: str = Header(default=""),
 ) -> dict:
-    """يستقبل الفصل ويبدأ تبييضه في الخلفية فوراً، ويرد في أقل من ثانية لتجنب Railway 502."""
     _check_auth(x_worker_token)
     if profile not in PROFILE_CHOICES:
         raise HTTPException(400, detail=f"unknown profile: {profile}")
@@ -178,6 +205,9 @@ async def create_job(
         work_dir=work_dir,
         in_zip=in_zip,
         out_zip=out_zip,
+        job_name=job_name or "chapter",
+        upload_gofile=upload_gofile.strip().lower() in ("1", "true", "yes"),
+        gofile_token=gofile_token.strip() or None,
     )
     _jobs[job_id] = job
     asyncio.create_task(_run_worker_job(job))
@@ -193,13 +223,17 @@ async def get_job_status(
     job = _jobs.get(job_id)
     if job is None:
         raise HTTPException(404, detail="job not found or expired")
-    return {
+    resp = {
         "job_id": job.job_id,
         "status": job.status,
         "done_pages": job.done_pages,
         "total_pages": job.total_pages,
+        "result_url": job.result_url,
         "error": job.error,
     }
+    if job.status == "done" and job.result_url:
+        _cleanup_job(job_id)
+    return resp
 
 
 @app.get("/jobs/{job_id}/result")
@@ -253,6 +287,6 @@ async def clean(
                 )
         except ValueError as exc:
             raise HTTPException(422, detail=str(exc)[:500]) from exc
-        except RuntimeError as exc:  # LocalCleanError و CliCleanError كلهم RuntimeError
+        except RuntimeError as exc:
             raise HTTPException(422, detail=str(exc)[:500]) from exc
     return Response(content=cleaned, media_type="application/zip")
