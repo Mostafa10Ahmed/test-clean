@@ -24,44 +24,72 @@ function naturalSort(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 }
 
-function getTsxBin(): string {
-  const localBin = path.resolve(process.cwd(), 'node_modules', '.bin', 'tsx');
-  return fs.existsSync(localBin) ? localBin : 'npx';
-}
+function runBatchSubprocess(
+  stage: 'ctd' | 'rtdetr' | 'clean',
+  manifestPath: string,
+  extraEnv: Record<string, string>,
+  onProgress?: (p: IsolatedJobProgress) => void
+): Promise<{ ok: boolean; code: number | null; signal: string | null; errorText: string }> {
+  return new Promise((resolve) => {
+    const compiledRunner = path.resolve(process.cwd(), 'dist-server', 'onnxStageRunner.mjs');
+    const useCompiled = fs.existsSync(compiledRunner);
+    const localTsx = path.resolve(process.cwd(), 'node_modules', '.bin', 'tsx');
 
-function runStageSubprocess(args: string[], stageLabel: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const bin = getTsxBin();
-    const runnerPath = path.resolve(process.cwd(), 'src/server/onnxStageRunner.ts');
-    const fullArgs = bin === 'npx' ? ['tsx', runnerPath, ...args] : [runnerPath, ...args];
+    const cmd = useCompiled ? process.execPath : fs.existsSync(localTsx) ? localTsx : 'npx';
+    const args = useCompiled
+      ? [compiledRunner, stage, manifestPath]
+      : fs.existsSync(localTsx)
+        ? [path.resolve(process.cwd(), 'src/server/onnxStageRunner.ts'), stage, manifestPath]
+        : ['tsx', path.resolve(process.cwd(), 'src/server/onnxStageRunner.ts'), stage, manifestPath];
 
-    const child = spawn(bin, fullArgs, {
+    const child = spawn(cmd, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        NODE_OPTIONS: process.env.SUBPROCESS_NODE_OPTIONS || '--max-old-space-size=320',
+        ...extraEnv,
+        NODE_OPTIONS: process.env.SUBPROCESS_NODE_OPTIONS || '--max-old-space-size=256',
       },
     });
 
     let stderrTail = '';
-    child.stdout?.on('data', (d) => process.stdout.write(d));
-    child.stderr?.on('data', (d) => {
-      const s = d.toString();
-      stderrTail = (stderrTail + s).slice(-800);
-      process.stderr.write(d);
+    let stdoutBuf = '';
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
+      stdoutBuf += text;
+      const lines = stdoutBuf.split('\n');
+      stdoutBuf = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith('PROGRESS:')) {
+          const [, st, cur, tot] = line.trim().split(':');
+          onProgress?.({
+            stage: st,
+            currentPage: Number(cur) || 1,
+            totalPages: Number(tot) || 1,
+          });
+        } else if (line.trim()) {
+          console.log(line);
+        }
+      }
     });
 
-    child.on('error', reject);
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const s = chunk.toString();
+      stderrTail = (stderrTail + s).slice(-800);
+      process.stderr.write(chunk);
+    });
+
+    child.on('error', (err) => {
+      resolve({ ok: false, code: -1, signal: null, errorText: err.message });
+    });
+
     child.on('close', (code, signal) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(
-          new Error(
-            `Stage ${stageLabel} exited with ${signal ? `signal ${signal}` : `code ${code}`}${stderrTail ? `: ${stderrTail.trim().slice(-200)}` : ''}`
-          )
-        );
-      }
+      resolve({
+        ok: code === 0,
+        code,
+        signal: signal ? String(signal) : null,
+        errorText: stderrTail.trim().slice(-240),
+      });
     });
   });
 }
@@ -89,8 +117,6 @@ export async function runIsolatedWorkerJob(params: {
     enableSFX: params.cleanSfx,
     bubbleCleanMode: params.bubbleCleanMode || params.baseSettings.bubbleCleanMode || 'WHITEN',
   };
-  const settingsPath = path.join(jobRoot, 'settings.json');
-  fs.writeFileSync(settingsPath, JSON.stringify(settings), 'utf-8');
 
   params.onProgress?.({ stage: 'EXTRACTING', currentPage: 0, totalPages: 0 });
 
@@ -113,65 +139,95 @@ export async function runIsolatedWorkerJob(params: {
     pageNames.push(base);
   }
 
-  // Delete original upload immediately after extracting
   await fs.promises.unlink(params.inputDiskPath).catch(() => {});
 
   if (pageNames.length === 0) {
     throw new Error('No valid PNG/JPG/WebP images found in upload');
   }
 
-  let totalCleanedRegions = 0;
-  const cleanedFiles: { name: string; fullPath: string }[] = [];
+  const pages = pageNames.map((name, index) => ({
+    index,
+    name,
+    inPath: path.join(inDir, name),
+    outPath: path.join(outDir, `${name.replace(/\.[^.]+$/, '')}_cleaned.png`),
+    scratchDir: path.join(scratchDir, `p_${index}`),
+  }));
 
-  for (let i = 0; i < pageNames.length; i++) {
-    const name = pageNames[i];
-    const inPath = path.join(inDir, name);
-    const outName = `${name.replace(/\.[^.]+$/, '')}_cleaned.png`;
-    const outPath = path.join(outDir, outName);
-    const pageScratch = path.join(scratchDir, `p_${i}`);
-    fs.mkdirSync(pageScratch, { recursive: true });
+  const manifestPath = path.join(jobRoot, 'manifest.json');
+  fs.writeFileSync(manifestPath, JSON.stringify({ pages, settings }), 'utf-8');
 
-    // Stage 1: CTD in its own isolated subprocess (100% RAM reclaimed on exit)
-    params.onProgress?.({ stage: 'DETECTING_CTD', currentPage: i + 1, totalPages: pageNames.length });
-    await runStageSubprocess(['ctd', inPath, pageScratch], `CTD p${i + 1}`);
-
-    // Stage 2: RT-DETR in its own isolated subprocess (100% RAM reclaimed on exit)
-    params.onProgress?.({ stage: 'DETECTING_RTDETR', currentPage: i + 1, totalPages: pageNames.length });
-    await runStageSubprocess(['rtdetr', inPath, pageScratch, settingsPath], `RT-DETR p${i + 1}`);
-
-    // Stage 3: Clean + LaMa inpainting in its own isolated subprocess (100% RAM reclaimed on exit)
-    params.onProgress?.({ stage: 'CLEANING_LAMA', currentPage: i + 1, totalPages: pageNames.length });
-    await runStageSubprocess(['clean', inPath, pageScratch, settingsPath, outPath], `CLEAN/LaMa p${i + 1}`);
-
-    const statsPath = path.join(pageScratch, 'clean_stats.json');
-    if (fs.existsSync(statsPath)) {
-      try {
-        const st = JSON.parse(fs.readFileSync(statsPath, 'utf-8')) as { cleanedRegions?: number };
-        totalCleanedRegions += st.cleanedRegions || 0;
-      } catch {
-        // ignore
-      }
+  // Stage 1 (BATCH): CTD loads ONCE for entire chapter, then exits (100% RAM reclaimed!)
+  if (process.env.ENABLE_CTD !== '0' && process.env.ENABLE_CTD !== 'false') {
+    params.onProgress?.({ stage: 'DETECTING_CTD', currentPage: 1, totalPages: pages.length });
+    const ctdRes = await runBatchSubprocess('ctd', manifestPath, {}, params.onProgress);
+    if (!ctdRes.ok) {
+      // If CTD hit OOM (137) on an ultra-tall stitched chapter, continue with RT-DETR + LaMa instead of failing!
+      console.warn(
+        `[Worker] CTD batch exited (${ctdRes.signal || ctdRes.code}) — continuing cleanly with RT-DETR + LaMa.`
+      );
     }
-
-    cleanedFiles.push({ name: outName, fullPath: outPath });
-    // Free disk scratch & original page immediately
-    await fs.promises.rm(pageScratch, { recursive: true, force: true }).catch(() => {});
-    await fs.promises.unlink(inPath).catch(() => {});
   }
 
-  params.onProgress?.({ stage: 'PACKAGING', currentPage: pageNames.length, totalPages: pageNames.length });
+  // Stage 2 (BATCH): RT-DETR INT8 loads ONCE for entire chapter, fuses CTD masks if present, then exits!
+  params.onProgress?.({ stage: 'DETECTING_RTDETR', currentPage: 1, totalPages: pages.length });
+  const detRes = await runBatchSubprocess(
+    'rtdetr',
+    manifestPath,
+    { ENABLE_CTD: '0' }, // never reload CTD inside RT-DETR stage
+    params.onProgress
+  );
+  if (!detRes.ok) {
+    throw new Error(`Stage RT-DETR failed (${detRes.signal || detRes.code}): ${detRes.errorText}`);
+  }
+
+  // Stage 3 (BATCH): Cleaning + LaMa inpainting loads ONCE for entire chapter, then exits!
+  params.onProgress?.({ stage: 'CLEANING_LAMA', currentPage: 1, totalPages: pages.length });
+  const cleanRes = await runBatchSubprocess('clean', manifestPath, {}, params.onProgress);
+  if (!cleanRes.ok) {
+    // If LaMa hit OOM (137) on a huge stitched chapter, retry clean stage with built-in JS inpainting fallback!
+    if (cleanRes.code === 137 || cleanRes.signal === 'SIGKILL') {
+      console.warn('[Worker] LaMa clean batch hit OOM (137) — retrying with low-RAM inpainting fallback.');
+      const fallbackRes = await runBatchSubprocess(
+        'clean',
+        manifestPath,
+        { ENABLE_LAMA: '0' },
+        params.onProgress
+      );
+      if (!fallbackRes.ok) {
+        throw new Error(
+          `Stage CLEAN fallback failed (${fallbackRes.signal || fallbackRes.code}): ${fallbackRes.errorText}`
+        );
+      }
+    } else {
+      throw new Error(`Stage CLEAN failed (${cleanRes.signal || cleanRes.code}): ${cleanRes.errorText}`);
+    }
+  }
+
+  let totalCleanedRegions = 0;
+  const statsPath = path.join(outDir, 'batch_stats.json');
+  if (fs.existsSync(statsPath)) {
+    try {
+      const st = JSON.parse(fs.readFileSync(statsPath, 'utf-8')) as { cleanedRegions?: number };
+      totalCleanedRegions = st.cleanedRegions || 0;
+    } catch {
+      // ignore
+    }
+  }
+
+  params.onProgress?.({ stage: 'PACKAGING', currentPage: pages.length, totalPages: pages.length });
 
   let outputPath: string;
   let outputFileName: string;
 
-  if (cleanedFiles.length === 1) {
-    outputPath = cleanedFiles[0].fullPath;
-    outputFileName = cleanedFiles[0].name;
+  if (pages.length === 1) {
+    outputPath = pages[0].outPath;
+    outputFileName = path.basename(pages[0].outPath);
   } else {
     const outZip = new JSZip();
-    for (const cf of cleanedFiles) {
-      const data = await fs.promises.readFile(cf.fullPath);
-      outZip.file(cf.name, data);
+    for (const p of pages) {
+      if (fs.existsSync(p.outPath)) {
+        outZip.file(path.basename(p.outPath), await fs.promises.readFile(p.outPath));
+      }
     }
     const zipBuf = await outZip.generateAsync({ type: 'nodebuffer', compression: 'STORE' });
     outputFileName = `${params.jobId}_cleaned.zip`;
@@ -183,7 +239,7 @@ export async function runIsolatedWorkerJob(params: {
   return {
     outputPath,
     outputFileName,
-    totalPages: pageNames.length,
+    totalPages: pages.length,
     cleanedRegions: totalCleanedRegions,
     totalProcessingTimeMs: Date.now() - t0,
     bubbleCleanMode: settings.bubbleCleanMode,

@@ -11,8 +11,7 @@ COPY . .
 RUN npm run build
 
 ENV NODE_ENV=production
-ENV NODE_OPTIONS="--max-old-space-size=320"
 ENV PORT=3000
 EXPOSE 3000
 
-CMD ["npx", "tsx", "server.ts"]
+CMD ["sh", "-c", "if [ \"$WORKER_MODE\" = \"1\" ] || [ \"$WORKER_MODE\" = \"true\" ]; then exec node --max-old-space-size=128 dist-server/workerEntry.mjs; else exec node --max-old-space-size=384 dist-server/server.mjs; fi"]

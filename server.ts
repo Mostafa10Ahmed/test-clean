@@ -167,6 +167,9 @@ async function startServer() {
     for (const [k, v] of workerJobs.entries()) {
       if (v.createdAt < cutoff && (v.status === 'COMPLETED' || v.status === 'FAILED')) {
         workerJobs.delete(k);
+        fs.promises
+          .rm(path.join(os.tmpdir(), 'bearbot-isolated-jobs', k), { recursive: true, force: true })
+          .catch(() => {});
       }
     }
 

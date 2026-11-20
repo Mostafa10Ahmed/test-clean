@@ -7,6 +7,7 @@ import {
   cleanRegionWithOnnxSupport,
   getCachedPageCtd,
   setCachedPageCtd,
+  clearPageCtdCache,
   releaseAllOnnxSessions,
 } from '../engine/onnxPipeline';
 import { detectRegionsInRgbaBuffer, measureSurroundRing } from '../engine/detector';
@@ -15,33 +16,36 @@ import { CleaningSettings, DetectedRegion } from '../engine/types';
 sharp.cache(false);
 sharp.concurrency(1);
 
-async function main() {
-  const [stage, imagePath, workDir, settingsJsonPath, outPngPath] = process.argv.slice(2);
-  if (!stage || !imagePath || !workDir) {
-    console.error('Usage: tsx onnxStageRunner.ts <ctd|rtdetr|clean> <imagePath> <workDir> [settingsJson] [outPngPath]');
-    process.exit(2);
-  }
+interface BatchManifest {
+  pages: {
+    index: number;
+    name: string;
+    inPath: string;
+    outPath: string;
+    scratchDir: string;
+  }[];
+  settings: CleaningSettings;
+}
 
-  fs.mkdirSync(workDir, { recursive: true });
-  const image = sharp(imagePath, { limitInputPixels: false });
-  const meta = await image.metadata();
-  const width = meta.width || 800;
-  const height = meta.height || 1200;
-  const rawBuffer = await image.ensureAlpha().raw().toBuffer();
-  const rgba = new Uint8Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+async function runCtdBatch(manifest: BatchManifest) {
+  for (const p of manifest.pages) {
+    fs.mkdirSync(p.scratchDir, { recursive: true });
+    const image = sharp(p.inPath, { limitInputPixels: false });
+    const meta = await image.metadata();
+    const width = meta.width || 800;
+    const height = meta.height || 1200;
+    const rawBuffer = await image.ensureAlpha().raw().toBuffer();
+    const rgba = new Uint8Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
 
-  const maskPath = path.join(workDir, 'ctd_mask.bin');
-  const ctdMetaPath = path.join(workDir, 'ctd_meta.json');
-  const regionsPath = path.join(workDir, 'regions.json');
-  const statsPath = path.join(workDir, 'clean_stats.json');
-
-  if (stage === 'ctd') {
     const mask = await computePageCtdSegMask(rgba, width, height);
     const cached = getCachedPageCtd();
     if (mask && cached) {
-      fs.writeFileSync(maskPath, Buffer.from(mask.buffer, mask.byteOffset, mask.byteLength));
       fs.writeFileSync(
-        ctdMetaPath,
+        path.join(p.scratchDir, 'ctd_mask.bin'),
+        Buffer.from(mask.buffer, mask.byteOffset, mask.byteLength)
+      );
+      fs.writeFileSync(
+        path.join(p.scratchDir, 'ctd_meta.json'),
         JSON.stringify({
           width: cached.width,
           height: cached.height,
@@ -51,14 +55,29 @@ async function main() {
         'utf-8'
       );
     }
-    await releaseAllOnnxSessions();
-    console.log(`[Subprocess:CTD] Done ${path.basename(imagePath)} | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
-    return;
+    clearPageCtdCache();
+    console.log(
+      `PROGRESS:DETECTING_CTD:${p.index + 1}:${manifest.pages.length}`
+    );
+    console.log(
+      `[Subprocess:CTD] Page ${p.index + 1}/${manifest.pages.length} (${p.name}) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`
+    );
   }
+  await releaseAllOnnxSessions();
+}
 
-  const settings = JSON.parse(fs.readFileSync(settingsJsonPath, 'utf-8')) as CleaningSettings;
+async function runRtdetrBatch(manifest: BatchManifest) {
+  for (const p of manifest.pages) {
+    fs.mkdirSync(p.scratchDir, { recursive: true });
+    const image = sharp(p.inPath, { limitInputPixels: false });
+    const meta = await image.metadata();
+    const width = meta.width || 800;
+    const height = meta.height || 1200;
+    const rawBuffer = await image.ensureAlpha().raw().toBuffer();
+    const rgba = new Uint8Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
 
-  if (stage === 'rtdetr') {
+    const maskPath = path.join(p.scratchDir, 'ctd_mask.bin');
+    const ctdMetaPath = path.join(p.scratchDir, 'ctd_meta.json');
     if (fs.existsSync(maskPath) && fs.existsSync(ctdMetaPath)) {
       const ctdMeta = JSON.parse(fs.readFileSync(ctdMetaPath, 'utf-8')) as {
         width: number;
@@ -74,24 +93,49 @@ async function main() {
         segMask: new Uint8Array(maskBuf.buffer, maskBuf.byteOffset, maskBuf.byteLength),
         blkBoxes: ctdMeta.blkBoxes || [],
       });
+    } else {
+      clearPageCtdCache();
     }
 
-    const onnxRegions = await detectRegionsWithOnnx(rgba, width, height, 0, settings);
+    const onnxRegions = await detectRegionsWithOnnx(rgba, width, height, p.index, manifest.settings);
     const regions: DetectedRegion[] =
       onnxRegions.length > 0
         ? onnxRegions
-        : detectRegionsInRgbaBuffer(rgba, width, height, 0, settings);
+        : detectRegionsInRgbaBuffer(rgba, width, height, p.index, manifest.settings);
 
-    fs.writeFileSync(regionsPath, JSON.stringify(regions), 'utf-8');
-    await releaseAllOnnxSessions();
-    console.log(`[Subprocess:RT-DETR] Done ${path.basename(imagePath)} (${regions.length} regions) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
-    return;
+    fs.writeFileSync(path.join(p.scratchDir, 'regions.json'), JSON.stringify(regions), 'utf-8');
+    clearPageCtdCache();
+    // Free CTD mask immediately after RT-DETR fusion
+    fs.promises.unlink(maskPath).catch(() => {});
+    fs.promises.unlink(ctdMetaPath).catch(() => {});
+
+    console.log(
+      `PROGRESS:DETECTING_RTDETR:${p.index + 1}:${manifest.pages.length}`
+    );
+    console.log(
+      `[Subprocess:RT-DETR] Page ${p.index + 1}/${manifest.pages.length} (${regions.length} regions) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`
+    );
   }
+  await releaseAllOnnxSessions();
+}
 
-  if (stage === 'clean') {
+async function runCleanBatch(manifest: BatchManifest) {
+  let totalCleaned = 0;
+  for (const p of manifest.pages) {
     const t0 = performance.now();
-    const regions = JSON.parse(fs.readFileSync(regionsPath, 'utf-8')) as DetectedRegion[];
+    const image = sharp(p.inPath, { limitInputPixels: false });
+    const meta = await image.metadata();
+    const width = meta.width || 800;
+    const height = meta.height || 1200;
+    const rawBuffer = await image.ensureAlpha().raw().toBuffer();
+    const rgba = new Uint8Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+
+    const regionsPath = path.join(p.scratchDir, 'regions.json');
+    const regions = fs.existsSync(regionsPath)
+      ? (JSON.parse(fs.readFileSync(regionsPath, 'utf-8')) as DetectedRegion[])
+      : [];
     const workRgba = new Uint8Array(rgba);
+    const settings = manifest.settings;
     let cleanedCount = 0;
 
     for (const region of regions) {
@@ -150,16 +194,45 @@ async function main() {
       limitInputPixels: false,
     })
       .png({ compressionLevel: 6 })
-      .toFile(outPngPath);
+      .toFile(p.outPath);
 
-    await releaseAllOnnxSessions();
+    totalCleaned += cleanedCount;
+    fs.promises.rm(p.scratchDir, { recursive: true, force: true }).catch(() => {});
+    fs.promises.unlink(p.inPath).catch(() => {});
+
     const elapsedMs = Math.round(performance.now() - t0);
-    fs.writeFileSync(statsPath, JSON.stringify({ cleanedRegions: cleanedCount, elapsedMs }), 'utf-8');
-    console.log(`[Subprocess:CLEAN/LaMa] Done ${path.basename(imagePath)} (${cleanedCount} cleaned, ${elapsedMs}ms) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
-    return;
+    console.log(
+      `PROGRESS:CLEANING_LAMA:${p.index + 1}:${manifest.pages.length}`
+    );
+    console.log(
+      `[Subprocess:CLEAN/LaMa] Page ${p.index + 1}/${manifest.pages.length} (${cleanedCount} cleaned, ${elapsedMs}ms) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`
+    );
   }
 
-  throw new Error(`Unknown stage: ${stage}`);
+  fs.writeFileSync(
+    path.join(path.dirname(manifest.pages[0].outPath), 'batch_stats.json'),
+    JSON.stringify({ cleanedRegions: totalCleaned }),
+    'utf-8'
+  );
+  await releaseAllOnnxSessions();
+}
+
+async function main() {
+  const [stage, manifestPath] = process.argv.slice(2);
+  if (!stage || !manifestPath) {
+    console.error('Usage: node onnxStageRunner.mjs <ctd|rtdetr|clean> <manifest.json>');
+    process.exit(2);
+  }
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as BatchManifest;
+  if (stage === 'ctd') {
+    await runCtdBatch(manifest);
+  } else if (stage === 'rtdetr') {
+    await runRtdetrBatch(manifest);
+  } else if (stage === 'clean') {
+    await runCleanBatch(manifest);
+  } else {
+    throw new Error(`Unknown batch stage: ${stage}`);
+  }
 }
 
 main()

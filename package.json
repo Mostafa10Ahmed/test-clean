@@ -5,14 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "start": "tsx server.ts",
-    "build": "vite build",
+    "start": "node dist-server/server.mjs",
+    "build": "vite build && npm run build:server",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test": "npx --yes tsx --test src/engine/*.test.ts",
     "download-models": "node scripts/download-models.mjs",
-    "export-repo": "node scripts/export-repo.mjs"
+    "export-repo": "node scripts/export-repo.mjs",
+    "build:server": "esbuild server.ts src/server/workerEntry.ts src/server/onnxStageRunner.ts --bundle --platform=node --format=esm --packages=external --outdir=dist-server --out-extension:.js=.mjs"
   },
   "dependencies": {
     "@google/genai": "^3.3.0",
