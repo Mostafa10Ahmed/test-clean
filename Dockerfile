@@ -8,7 +8,11 @@ COPY package.json ./
 RUN npm install --legacy-peer-deps
 
 COPY . .
-RUN npm run build
+RUN npm run build && \
+    ./node_modules/.bin/esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=dist-server/server.mjs && \
+    ./node_modules/.bin/esbuild src/server/workerEntry.ts --bundle --platform=node --format=esm --packages=external --outfile=dist-server/workerEntry.mjs && \
+    ./node_modules/.bin/esbuild src/server/onnxStageRunner.ts --bundle --platform=node --format=esm --packages=external --outfile=dist-server/onnxStageRunner.mjs && \
+    ls -lh dist-server/
 
 ENV NODE_ENV=production
 ENV PORT=3000
