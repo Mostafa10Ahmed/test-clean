@@ -160,14 +160,59 @@ export class BearDiscordBot {
 
     try {
       this.client = new Client({
-        intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+        intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
       });
 
       this.client.once('ready', async (readyClient) => {
         this.connected = true;
         this.botTag = readyClient.user.tag;
         console.log(`Discord bot connected as ${this.botTag}`);
-        await this.registerSlashCommands(token, readyClient.user.id);
+        const guildIds = Array.from(readyClient.guilds.cache.keys());
+        await this.registerSlashCommands(token, readyClient.user.id, guildIds);
+      });
+
+      // Prefix command: $sync (or @Bot sync) to clear old commands & instantly refresh slash commands
+      this.client.on('messageCreate', async (message) => {
+        if (message.author.bot || !message.guild) return;
+        const raw = message.content.trim();
+        const botId = this.client?.user?.id;
+        const mentionMatch = botId && new RegExp(`^<@!?${botId}>\\s+sync(\\s+clear)?$`, 'i').test(raw);
+        const prefixMatch = /^\$sync(\s+clear)?$/i.test(raw);
+        if (!prefixMatch && !mentionMatch) return;
+
+        const adminRoleId = (process.env.ADMIN_ROLE_ID || '').trim();
+        const hasAdminPerm = Boolean(
+          message.member?.permissions.has(PermissionFlagsBits.Administrator) ||
+            message.member?.permissions.has(PermissionFlagsBits.ManageGuild) ||
+            (adminRoleId && message.member?.roles.cache.has(adminRoleId))
+        );
+        if (!hasAdminPerm) {
+          await message.reply('❌ الأمر `$sync` للأدمن بس.').catch(() => {});
+          return;
+        }
+
+        const statusMsg = await message.reply('🔄 جاري مسح الأوامر القديمة وتحديث أوامر السلاش في السيرفر...').catch(() => null);
+        try {
+          if (!botId) throw new Error('Bot client ID unavailable');
+          const rest = new REST({ version: '10' }).setToken(token);
+          // Clear old guild commands first, then push fresh commands to this guild & globally
+          await rest.put(Routes.applicationGuildCommands(botId, message.guild.id), { body: [] });
+          await this.registerSlashCommands(token, botId, [message.guild.id]);
+          const cmdList = this.slashCommands.map((c) => `\`${c}\``).join(' · ');
+          const okText = `✅ تم مسح الأوامر القديمة وتحديث أوامر السلاش فوراً في السيرفر!\nالأوامر المتاحة: ${cmdList}`;
+          if (statusMsg) {
+            await statusMsg.edit(okText).catch(() => {});
+          } else {
+            await message.reply(okText).catch(() => {});
+          }
+        } catch (err) {
+          const errText = `❌ فشل تحديث الأوامر: ${(err as Error).message}`;
+          if (statusMsg) {
+            await statusMsg.edit(errText).catch(() => {});
+          } else {
+            await message.reply(errText).catch(() => {});
+          }
+        }
       });
 
       this.client.on('interactionCreate', async (interaction) => {
@@ -587,7 +632,7 @@ export class BearDiscordBot {
     });
   }
 
-  private async registerSlashCommands(token: string, clientId: string): Promise<void> {
+  private async registerSlashCommands(token: string, clientId: string, guildIds: string[] = []): Promise<void> {
     const commands = [
       new SlashCommandBuilder()
         .setName('profile')
@@ -676,9 +721,14 @@ export class BearDiscordBot {
     const rest = new REST({ version: '10' }).setToken(token);
     await rest.put(Routes.applicationCommands(clientId), { body: commands });
 
-    const guildId = (process.env.DISCORD_GUILD_ID || '').trim();
-    if (guildId) {
-      await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands }).catch(() => {});
+    const targets = new Set<string>(guildIds);
+    const envGuildId = (process.env.DISCORD_GUILD_ID || '').trim();
+    if (envGuildId) targets.add(envGuildId);
+
+    for (const gid of targets) {
+      await rest.put(Routes.applicationGuildCommands(clientId, gid), { body: commands }).catch((err) => {
+        console.warn(`Guild command sync skipped for ${gid}:`, (err as Error).message);
+      });
     }
   }
 }
