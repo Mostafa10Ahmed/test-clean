@@ -18,6 +18,7 @@ import {
 import { ChapterCleaningManager } from './chapterProcessor';
 import { BubbleCleanMode } from '../engine/types';
 import { cleanWithRemoteWorker, isRemoteWorkerConfigured } from './remoteWorkerClient';
+import { uploadToGofile } from './gofile';
 import {
   createAuthUrl,
   completeManualCodeFromUser,
@@ -272,6 +273,7 @@ export class BearDiscordBot {
               const attachment = interaction.options.getAttachment('file');
               const driveLinkOpt = interaction.options.getString('drive_link')?.trim() || '';
               const uploadToDriveOpt = interaction.options.getBoolean('upload_to_drive');
+              const uploadToGofileOpt = interaction.options.getBoolean('upload_to_gofile');
               const outputFolderOpt = interaction.options.getString('output_drive_folder')?.trim() || '';
               const chapterOpt = interaction.options.getString('chapter') || '';
               const bubbleModeOpt = interaction.options.getString('bubble_mode');
@@ -377,38 +379,72 @@ export class BearDiscordBot {
 
                 try {
                   const fileSize = outputPath && fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
-                  const shouldUploadToDrive =
+                  const shouldTryDrive =
                     uploadToDriveOpt === true ||
                     (uploadToDriveOpt !== false && (Boolean(driveLinkOpt) || fileSize > DISCORD_MAX_ATTACHMENT_BYTES));
 
                   let uploadedDriveLink = '';
                   let driveSourceLabel = '';
+                  let driveErrNote = '';
+                  let uploadedGofileLink = '';
+                  let gofileErrNote = '';
 
-                  if (shouldUploadToDrive && outputPath && fs.existsSync(outputPath)) {
-                    if (!driveAuth) {
-                      driveAuth = await resolveDriveAuth(interaction.user.id, interaction.guildId);
-                    }
-                    if (driveAuth) {
-                      let targetFolderId = driveAuth.folderId;
-                      if (outputFolderOpt) {
-                        const parsedTarget = parseDriveUrl(outputFolderOpt);
-                        if (parsedTarget?.id) targetFolderId = parsedTarget.id;
-                      } else if (sourceFolderId && driveLinkOpt) {
-                        targetFolderId = driveAuth.folderId;
+                  if (shouldTryDrive && outputPath && fs.existsSync(outputPath)) {
+                    try {
+                      if (!driveAuth) {
+                        driveAuth = await resolveDriveAuth(interaction.user.id, interaction.guildId);
                       }
+                      if (driveAuth) {
+                        let targetFolderId = driveAuth.folderId;
+                        if (outputFolderOpt) {
+                          const parsedTarget = parseDriveUrl(outputFolderOpt);
+                          if (parsedTarget?.id) targetFolderId = parsedTarget.id;
+                        } else if (sourceFolderId && driveLinkOpt) {
+                          targetFolderId = driveAuth.folderId;
+                        }
+                        const outBuf = await fs.promises.readFile(outputPath);
+                        const mimeType = outputFileName.toLowerCase().endsWith('.png')
+                          ? 'image/png'
+                          : 'application/zip';
+                        const up = await uploadToDrive({
+                          accessToken: driveAuth.accessToken,
+                          parentFolderId: targetFolderId,
+                          fileName: outputFileName,
+                          buffer: outBuf,
+                          mimeType,
+                        });
+                        uploadedDriveLink = up.webViewLink;
+                        driveSourceLabel = driveAuth.sourceLabel;
+                      } else if (uploadToDriveOpt === true) {
+                        driveErrNote = 'مفيش حساب Google Drive مربوط أو التوكن منتهي — اربط من `/profile`.';
+                      }
+                    } catch (dErr) {
+                      driveErrNote = (dErr as Error).message;
+                      console.warn('Google Drive upload failed, falling back to Gofile:', driveErrNote);
+                    }
+                  }
+
+                  // Upload to Gofile if explicitly requested, OR if file > 24MB and Drive didn't succeed, OR if Drive failed
+                  const shouldUploadGofile =
+                    outputPath &&
+                    fs.existsSync(outputPath) &&
+                    (uploadToGofileOpt === true ||
+                      (!uploadedDriveLink && (fileSize > DISCORD_MAX_ATTACHMENT_BYTES || Boolean(driveErrNote))));
+
+                  if (shouldUploadGofile) {
+                    try {
                       const outBuf = await fs.promises.readFile(outputPath);
                       const mimeType = outputFileName.toLowerCase().endsWith('.png')
                         ? 'image/png'
                         : 'application/zip';
-                      const up = await uploadToDrive({
-                        accessToken: driveAuth.accessToken,
-                        parentFolderId: targetFolderId,
-                        fileName: outputFileName,
+                      uploadedGofileLink = await uploadToGofile({
                         buffer: outBuf,
+                        fileName: outputFileName,
                         mimeType,
                       });
-                      uploadedDriveLink = up.webViewLink;
-                      driveSourceLabel = driveAuth.sourceLabel;
+                    } catch (gErr) {
+                      gofileErrNote = (gErr as Error).message;
+                      console.warn('Gofile upload failed:', gofileErrNote);
                     }
                   }
 
@@ -417,18 +453,31 @@ export class BearDiscordBot {
                     outputPath &&
                     fs.existsSync(outputPath) &&
                     fileSize <= DISCORD_MAX_ATTACHMENT_BYTES &&
-                    !uploadedDriveLink
+                    !uploadedDriveLink &&
+                    !uploadedGofileLink
                   ) {
                     filesToSend.push(new AttachmentBuilder(outputPath, { name: outputFileName }));
+                  }
+
+                  const linksLines: string[] = [];
+                  if (uploadedDriveLink) {
+                    linksLines.push(`📂 **[فتح النتيجة على Google Drive](${uploadedDriveLink})** (${driveSourceLabel})`);
+                  }
+                  if (uploadedGofileLink) {
+                    linksLines.push(`📦 **[تحميل النتيجة من Gofile](${uploadedGofileLink})**`);
+                  }
+                  if (driveErrNote && !uploadedDriveLink) {
+                    linksLines.push(`⚠️ تعذّر الرفع على Drive: ${driveErrNote}`);
+                  }
+                  if (gofileErrNote && !uploadedGofileLink) {
+                    linksLines.push(`⚠️ تعذّر الرفع على Gofile: ${gofileErrNote}`);
                   }
 
                   const embed = new EmbedBuilder()
                     .setTitle(`Cleaned: ${fileName}`)
                     .setDescription(
                       `Processed **${totalPages}** page(s) · **${cleanedRegions}** regions cleaned in **${(totalProcessingTimeMs / 1000).toFixed(2)}s**${isRemoteWorkerConfigured() ? ' (Remote Worker)' : ''}.` +
-                        (uploadedDriveLink
-                          ? `\n\n📂 **[فتح النتيجة على Google Drive](${uploadedDriveLink})** (${driveSourceLabel})`
-                          : '')
+                        (linksLines.length > 0 ? `\n\n${linksLines.join('\n')}` : '')
                     )
                     .addFields(
                       {
@@ -452,17 +501,25 @@ export class BearDiscordBot {
                     )
                     .setColor(0x0f172a);
 
-                  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+                  const linkRow = new ActionRowBuilder<ButtonBuilder>();
                   if (uploadedDriveLink) {
-                    components.push(
-                      new ActionRowBuilder<ButtonBuilder>().addComponents(
-                        new ButtonBuilder()
-                          .setLabel('📂 فتح الملف على Google Drive')
-                          .setStyle(ButtonStyle.Link)
-                          .setURL(uploadedDriveLink)
-                      )
+                    linkRow.addComponents(
+                      new ButtonBuilder()
+                        .setLabel('📂 فتح على Google Drive')
+                        .setStyle(ButtonStyle.Link)
+                        .setURL(uploadedDriveLink)
                     );
                   }
+                  if (uploadedGofileLink) {
+                    linkRow.addComponents(
+                      new ButtonBuilder()
+                        .setLabel('📦 تحميل من Gofile')
+                        .setStyle(ButtonStyle.Link)
+                        .setURL(uploadedGofileLink)
+                    );
+                  }
+                  const components: ActionRowBuilder<ButtonBuilder>[] =
+                    linkRow.components.length > 0 ? [linkRow] : [];
 
                   try {
                     await interaction.editReply({
@@ -697,6 +754,12 @@ export class BearDiscordBot {
           opt
             .setName('upload_to_drive')
             .setDescription('Upload cleaned result to your linked Google Drive (auto when using drive_link)')
+            .setRequired(false)
+        )
+        .addBooleanOption((opt) =>
+          opt
+            .setName('upload_to_gofile')
+            .setDescription('Upload cleaned result to Gofile and return a download link')
             .setRequired(false)
         )
         .addStringOption((opt) =>

@@ -494,23 +494,27 @@ export async function resolveDriveAuth(
     }
   }
 
-  // Fallback to token.json imported from TBATE_Bot
+  // Fallback to token.json imported from TBATE_Bot (safe try/catch so expired token never breaks /clean)
   const fallback = getFallbackTokenJson();
   if (fallback) {
-    const accessToken = await refreshAccessToken(
-      'bot:default',
-      fallback.refreshToken,
-      fallback.clientId,
-      fallback.clientSecret
-    );
-    const { folderId, folderUrl } = await ensureDriveFolder(accessToken, DEFAULT_FOLDER_NAME);
-    return {
-      accessToken,
-      folderId,
-      folderUrl,
-      email: fallback.email,
-      sourceLabel: '🤖 درايف البوت الافتراضي',
-    };
+    try {
+      const accessToken = await refreshAccessToken(
+        'bot:default',
+        fallback.refreshToken,
+        fallback.clientId,
+        fallback.clientSecret
+      );
+      const { folderId, folderUrl } = await ensureDriveFolder(accessToken, DEFAULT_FOLDER_NAME);
+      return {
+        accessToken,
+        folderId,
+        folderUrl,
+        email: fallback.email,
+        sourceLabel: '🤖 درايف البوت الافتراضي',
+      };
+    } catch (err) {
+      console.warn('Fallback token.json refresh failed:', (err as Error).message);
+    }
   }
 
   return null;
