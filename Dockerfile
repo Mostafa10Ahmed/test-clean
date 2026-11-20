@@ -11,7 +11,7 @@ COPY . .
 RUN npm run build
 
 ENV NODE_ENV=production
-ENV NODE_OPTIONS="--max-old-space-size=448"
+ENV NODE_OPTIONS="--max-old-space-size=320"
 ENV PORT=3000
 EXPOSE 3000
 

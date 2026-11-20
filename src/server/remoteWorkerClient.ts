@@ -3,11 +3,21 @@ import os from 'os';
 import path from 'path';
 import { BubbleCleanMode } from '../engine/types';
 
+export interface RemoteJobProgress {
+  status: string;
+  stage?: string;
+  queuePosition?: number;
+  queueLength?: number;
+  currentPage?: number;
+  totalPages?: number;
+}
+
 export interface RemoteCleanRequest {
   fileName: string;
   buffer: Buffer;
   cleanSfx: boolean;
   bubbleCleanMode?: BubbleCleanMode;
+  onProgress?: (progress: RemoteJobProgress) => void;
 }
 
 export interface RemoteCleanResult {
@@ -64,12 +74,17 @@ export async function cleanWithRemoteWorker(req: RemoteCleanRequest): Promise<Re
     throw new Error('Worker did not return a jobId');
   }
 
-  const pollIntervalMs = Number(process.env.WORKER_POLL_MS) || 2500;
-  const maxWaitMs = Number(process.env.WORKER_TIMEOUT_MS) || 15 * 60 * 1000;
+  const pollIntervalMs = Number(process.env.WORKER_POLL_MS) || 3500;
+  // Generous 45-minute timeout so queued chapters never time out prematurely
+  const maxWaitMs = Number(process.env.WORKER_TIMEOUT_MS) || 45 * 60 * 1000;
   const startedAt = Date.now();
 
   let statusPayload: {
     status: string;
+    stage?: string;
+    queuePosition?: number;
+    queueLength?: number;
+    currentPage?: number;
     totalPages?: number;
     cleanedRegions?: number;
     totalProcessingTimeMs?: number;
@@ -78,23 +93,50 @@ export async function cleanWithRemoteWorker(req: RemoteCleanRequest): Promise<Re
     error?: string;
   } | null = null;
 
+  let consecutiveErrors = 0;
+
   while (Date.now() - startedAt < maxWaitMs) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
-    const pollRes = await fetch(`${baseUrl}/worker/jobs/${encodeURIComponent(jobId)}`, {
-      headers,
-    });
-    if (!pollRes.ok) {
-      if (pollRes.status === 404) {
-        throw new Error(`Worker job ${jobId} was lost (worker may have restarted)`);
+    try {
+      const pollRes = await fetch(`${baseUrl}/worker/jobs/${encodeURIComponent(jobId)}`, {
+        headers,
+      });
+      if (!pollRes.ok) {
+        if (pollRes.status === 404) {
+          throw new Error(`Worker job ${jobId} was lost (worker may have restarted)`);
+        }
+        consecutiveErrors++;
+        if (consecutiveErrors >= 15) {
+          throw new Error(`Worker unreachable (${pollRes.status}) after repeated retries`);
+        }
+        continue;
       }
-      continue;
-    }
-    statusPayload = (await pollRes.json()) as typeof statusPayload;
-    if (statusPayload?.status === 'COMPLETED') {
-      break;
-    }
-    if (statusPayload?.status === 'FAILED') {
-      throw new Error(statusPayload.error || 'Remote worker failed to clean chapter');
+      consecutiveErrors = 0;
+      statusPayload = (await pollRes.json()) as typeof statusPayload;
+      if (statusPayload) {
+        req.onProgress?.({
+          status: statusPayload.status,
+          stage: statusPayload.stage,
+          queuePosition: statusPayload.queuePosition,
+          queueLength: statusPayload.queueLength,
+          currentPage: statusPayload.currentPage,
+          totalPages: statusPayload.totalPages,
+        });
+      }
+      if (statusPayload?.status === 'COMPLETED') {
+        break;
+      }
+      if (statusPayload?.status === 'FAILED') {
+        throw new Error(statusPayload.error || 'Remote worker failed to clean chapter');
+      }
+    } catch (err) {
+      if ((err as Error).message.includes('was lost') || (err as Error).message.includes('failed to clean')) {
+        throw err;
+      }
+      consecutiveErrors++;
+      if (consecutiveErrors >= 15) {
+        throw err;
+      }
     }
   }
 

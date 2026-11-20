@@ -319,11 +319,33 @@ export class BearDiscordBot {
                 let cleanupOutputPath = false;
 
                 if (isRemoteWorkerConfigured()) {
+                  let lastStatusText = '';
                   const remote = await cleanWithRemoteWorker({
                     fileName,
                     buffer: inputBuffer,
                     cleanSfx,
                     bubbleCleanMode,
+                    onProgress: (p) => {
+                      let nextText = '';
+                      if (p.status === 'QUEUED') {
+                        nextText = `⏳ **في الطابور** — دورك رقم **${p.queuePosition || 1}** (إجمالي الطابور: ${p.queueLength || 1})…`;
+                      } else if (p.status === 'PROCESSING') {
+                        const pageInfo = p.totalPages ? `صفحة **${p.currentPage || 1}/${p.totalPages}**` : 'جاري التحضير';
+                        const stageMap: Record<string, string> = {
+                          EXTRACTING: 'فك الضغط',
+                          DETECTING_CTD: 'كشف النصوص (CTD)',
+                          DETECTING_RTDETR: 'تحديد الفقاعات (RT-DETR)',
+                          CLEANING_LAMA: 'التنظيف والـ LaMa Inpainting',
+                          PACKAGING: 'تجميع النتيجة',
+                        };
+                        const st = stageMap[p.stage || ''] || p.stage || 'المعالجة';
+                        nextText = `🧼 **جاري التنظيف** — ${pageInfo} · ${st}…`;
+                      }
+                      if (nextText && nextText !== lastStatusText) {
+                        lastStatusText = nextText;
+                        interaction.editReply({ content: nextText }).catch(() => {});
+                      }
+                    },
                   });
                   outputPath = remote.outputPath;
                   outputFileName = remote.outputFileName;
@@ -442,11 +464,24 @@ export class BearDiscordBot {
                     );
                   }
 
-                  await interaction.editReply({
-                    embeds: [embed],
-                    components,
-                    files: filesToSend,
-                  });
+                  try {
+                    await interaction.editReply({
+                      content: '',
+                      embeds: [embed],
+                      components,
+                      files: filesToSend,
+                    });
+                  } catch {
+                    // Fallback if queue wait exceeded Discord's 15-minute interaction token limit
+                    if (interaction.channel && 'send' in interaction.channel) {
+                      await interaction.channel.send({
+                        content: `<@${interaction.user.id}> ✅ خلص التنظيف!`,
+                        embeds: [embed],
+                        components,
+                        files: filesToSend,
+                      });
+                    }
+                  }
                 } finally {
                   if (cleanupOutputPath && outputPath) {
                     fs.promises.unlink(outputPath).catch(() => {});

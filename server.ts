@@ -15,6 +15,7 @@ import { createServer as createViteServer } from 'vite';
 import { ChapterCleaningManager } from './src/server/chapterProcessor';
 import { BearDiscordBot } from './src/server/discordBot';
 import { handleOAuthCallback } from './src/server/driveOAuth';
+import { runIsolatedWorkerJob } from './src/server/isolatedWorkerRunner';
 import { buildTestCleanRepoZip } from './src/server/repoExporter';
 
 const uploadTmpDir = path.join(os.tmpdir(), 'bearbot-uploads');
@@ -36,6 +37,8 @@ const workerDiskUpload = multer({
 interface WorkerJobRecord {
   jobId: string;
   status: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  stage: string;
+  currentPage: number;
   totalPages: number;
   processedPages: number;
   cleanedRegions: number;
@@ -60,8 +63,10 @@ async function startServer() {
     discordBot.startIfConfigured().catch(console.error);
   }
 
-  // --- WORKER ASYNC JOB QUEUE (1-at-a-time FIFO to stay safe on 1GB RAM) ---
+  // --- WORKER ASYNC FIFO QUEUE (1-at-a-time + subprocess isolation for full quality on 1GB RAM) ---
   const workerJobs = new Map<string, WorkerJobRecord>();
+  const pendingQueueIds: string[] = [];
+  let activeJobId: string | null = null;
   let workerQueueChain: Promise<void> = Promise.resolve();
 
   const checkWorkerAuth = (req: express.Request, res: express.Response): boolean => {
@@ -95,6 +100,8 @@ async function startServer() {
     const record: WorkerJobRecord = {
       jobId,
       status: 'QUEUED',
+      stage: 'QUEUED',
+      currentPage: 0,
       totalPages: 0,
       processedPages: 0,
       cleanedRegions: 0,
@@ -103,46 +110,55 @@ async function startServer() {
       createdAt: Date.now(),
     };
     workerJobs.set(jobId, record);
+    pendingQueueIds.push(jobId);
 
     const diskPath = uploaded.path;
     const origName = uploaded.originalname || 'chapter.zip';
+    const queuePosNow = pendingQueueIds.length + (activeJobId ? 1 : 0);
 
-    console.log(`[Worker] Queued ${jobId} (${origName}, ${(uploaded.size / 1048576).toFixed(2)} MB) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
+    console.log(`[Worker] Queued ${jobId} (#${queuePosNow}, ${origName}, ${(uploaded.size / 1048576).toFixed(2)} MB) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
     workerQueueChain = workerQueueChain.then(async () => {
+      const idx = pendingQueueIds.indexOf(jobId);
+      if (idx >= 0) pendingQueueIds.splice(idx, 1);
+      activeJobId = jobId;
       record.status = 'PROCESSING';
+      record.stage = 'EXTRACTING';
       console.log(`[Worker] Starting ${jobId} (${origName}, clean_sfx=${cleanSfx}) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
       try {
-        const buf = await fs.promises.readFile(diskPath);
-        await fs.promises.unlink(diskPath).catch(() => {});
+        const result = await runIsolatedWorkerJob({
+          jobId,
+          inputDiskPath: diskPath,
+          originalName: origName,
+          cleanSfx,
+          bubbleCleanMode,
+          baseSettings: manager.getSettings(),
+          onProgress: (p) => {
+            record.stage = p.stage;
+            record.currentPage = p.currentPage;
+            record.totalPages = p.totalPages;
+            record.processedPages = Math.max(0, p.currentPage - 1);
+          },
+        });
 
-        const job = await manager.ingestUploadedFiles(
-          [{ originalname: origName, buffer: buf }],
-          `Worker: ${origName}`,
-          { enableSFX: cleanSfx, bubbleCleanMode }
-        );
-
-        record.totalPages = job.totalPages;
-        record.processedPages = job.processedPages;
-        record.cleanedRegions = job.cleanedRegions;
-        record.totalProcessingTimeMs = job.totalProcessingTimeMs;
-        record.bubbleCleanMode = job.settings.bubbleCleanMode;
-
-        if (job.pages.length === 1 && job.pages[0].cleanedUrl) {
-          record.outputPath = manager.resolveDiskPathFromUrl(job.pages[0].cleanedUrl);
-          record.outputFileName = `${job.pages[0].fileName.replace(/\.[^.]+$/, '')}_cleaned.png`;
-        } else if (job.zipDownloadUrl) {
-          record.outputPath = manager.resolveDiskPathFromUrl(job.zipDownloadUrl);
-          record.outputFileName = `${job.id}_cleaned.zip`;
-        } else {
-          throw new Error('Worker finished job without producing output file');
-        }
+        record.totalPages = result.totalPages;
+        record.processedPages = result.totalPages;
+        record.currentPage = result.totalPages;
+        record.cleanedRegions = result.cleanedRegions;
+        record.totalProcessingTimeMs = result.totalProcessingTimeMs;
+        record.bubbleCleanMode = result.bubbleCleanMode;
+        record.outputPath = result.outputPath;
+        record.outputFileName = result.outputFileName;
+        record.stage = 'COMPLETED';
         record.status = 'COMPLETED';
-        console.log(`[Worker] Completed ${jobId} (${record.totalPages} pages, ${record.cleanedRegions} regions) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
+        console.log(`[Worker] Completed ${jobId} (${record.totalPages} pages, ${record.cleanedRegions} regions, ${(record.totalProcessingTimeMs / 1000).toFixed(1)}s) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
       } catch (err) {
         console.error(`[Worker] Failed ${jobId}:`, err);
         await fs.promises.unlink(diskPath).catch(() => {});
+        record.stage = 'FAILED';
         record.status = 'FAILED';
         record.error = (err as Error).message;
+      } finally {
+        activeJobId = null;
       }
     });
 
@@ -164,9 +180,16 @@ async function startServer() {
       res.status(404).json({ error: 'Job not found' });
       return;
     }
+    const qIdx = pendingQueueIds.indexOf(rec.jobId);
+    const queuePosition = rec.status === 'QUEUED' ? (qIdx >= 0 ? qIdx + 1 : 1) : 0;
+    const queueLength = pendingQueueIds.length + (activeJobId ? 1 : 0);
     res.json({
       jobId: rec.jobId,
       status: rec.status,
+      stage: rec.stage,
+      queuePosition,
+      queueLength,
+      currentPage: rec.currentPage,
       totalPages: rec.totalPages,
       processedPages: rec.processedPages,
       cleanedRegions: rec.cleanedRegions,

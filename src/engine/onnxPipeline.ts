@@ -33,10 +33,9 @@ const MODELS_DIR = process.env.MODEL_DIR
   ? path.resolve(process.env.MODEL_DIR)
   : path.resolve(process.cwd(), 'models');
 const LOW_RAM_MODE = process.env.LOW_RAM_MODE !== '0' && process.env.LOW_RAM_MODE !== 'false';
-const ONNX_THREADS = Math.max(1, Number(process.env.ONNX_THREADS) || (LOW_RAM_MODE ? 2 : 4));
-const ENABLE_LAMA = process.env.ENABLE_LAMA
-  ? process.env.ENABLE_LAMA === '1' || process.env.ENABLE_LAMA === 'true'
-  : !LOW_RAM_MODE;
+const ONNX_THREADS = Math.max(1, Number(process.env.ONNX_THREADS) || (LOW_RAM_MODE ? 1 : 4));
+const ENABLE_CTD = process.env.ENABLE_CTD !== '0' && process.env.ENABLE_CTD !== 'false';
+const ENABLE_LAMA = process.env.ENABLE_LAMA !== '0' && process.env.ENABLE_LAMA !== 'false';
 const RTDETR_MODEL_PATH = path.join(MODELS_DIR, 'detector-v4-s_int8.onnx');
 const CTD_MODEL_PATH = path.join(MODELS_DIR, 'comictextdetector.pt.onnx');
 const LAMA_MODEL_PATH = path.join(MODELS_DIR, 'lama-manga.onnx');
@@ -109,7 +108,7 @@ export async function getRtdetrSession(): Promise<OrtTypes.InferenceSession | nu
         interOpNumThreads: 1,
         enableCpuMemArena: !LOW_RAM_MODE,
         enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: 'all',
+        graphOptimizationLevel: LOW_RAM_MODE ? 'basic' : 'all',
       });
     })().catch((err) => {
       console.error('Failed to load detector-v4-s_int8.onnx:', err);
@@ -131,7 +130,7 @@ export async function getCtdSession(): Promise<OrtTypes.InferenceSession | null>
         interOpNumThreads: 1,
         enableCpuMemArena: !LOW_RAM_MODE,
         enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: 'all',
+        graphOptimizationLevel: LOW_RAM_MODE ? 'basic' : 'all',
       });
     })().catch((err) => {
       console.error('Failed to load comictextdetector.pt.onnx:', err);
@@ -178,6 +177,14 @@ export function clearPageCtdCache(): void {
   cachedPageCtd = null;
 }
 
+export function getCachedPageCtd() {
+  return cachedPageCtd;
+}
+
+export function setCachedPageCtd(data: typeof cachedPageCtd): void {
+  cachedPageCtd = data;
+}
+
 export async function releaseAllOnnxSessions(): Promise<void> {
   cachedPageCtd = null;
   await releaseCtdSession();
@@ -203,7 +210,7 @@ export async function getLamaSession(): Promise<OrtTypes.InferenceSession | null
         interOpNumThreads: 1,
         enableCpuMemArena: !LOW_RAM_MODE,
         enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: 'all',
+        graphOptimizationLevel: LOW_RAM_MODE ? 'basic' : 'all',
       });
     })().catch((err) => {
       console.error('Failed to load lama-manga.onnx:', err);
@@ -662,10 +669,21 @@ export async function detectRegionsWithOnnx(
 ): Promise<DetectedRegion[]> {
   let session: OrtTypes.InferenceSession | null = null;
   let pageCtdMask: Uint8Array | null = null;
-  if (LOW_RAM_MODE) {
-    await releaseLamaSession();
-    pageCtdMask = await computePageCtdSegMask(rgba, imgWidth, imgHeight);
-    await releaseCtdSession();
+  const precomputedFp = computeRgbaFingerprint(rgba, imgWidth, imgHeight);
+  const hasPrecomputedCtd = Boolean(
+    cachedPageCtd &&
+      cachedPageCtd.width === imgWidth &&
+      cachedPageCtd.height === imgHeight &&
+      cachedPageCtd.fingerprint === precomputedFp
+  );
+  if (LOW_RAM_MODE || hasPrecomputedCtd) {
+    if (hasPrecomputedCtd && cachedPageCtd) {
+      pageCtdMask = cachedPageCtd.segMask;
+    } else if (ENABLE_CTD) {
+      await releaseLamaSession();
+      pageCtdMask = await computePageCtdSegMask(rgba, imgWidth, imgHeight);
+      await releaseCtdSession();
+    }
     session = await getRtdetrSession();
   } else {
     [session, pageCtdMask] = await Promise.all([
