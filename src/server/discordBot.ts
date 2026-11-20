@@ -274,6 +274,9 @@ export class BearDiscordBot {
               const driveLinkOpt = interaction.options.getString('drive_link')?.trim() || '';
               const uploadToDriveOpt = interaction.options.getBoolean('upload_to_drive');
               const uploadToGofileOpt = interaction.options.getBoolean('upload_to_gofile');
+              const outputFormatRaw = (interaction.options.getString('output_format') || 'jpg').toLowerCase();
+              const outputFormat: 'jpg' | 'png' | 'psd' =
+                outputFormatRaw === 'psd' ? 'psd' : outputFormatRaw === 'png' ? 'png' : 'jpg';
               const outputFolderOpt = interaction.options.getString('output_drive_folder')?.trim() || '';
               const chapterOpt = interaction.options.getString('chapter') || '';
               const bubbleModeOpt = interaction.options.getString('bubble_mode');
@@ -327,6 +330,7 @@ export class BearDiscordBot {
                     buffer: inputBuffer,
                     cleanSfx,
                     bubbleCleanMode,
+                    outputFormat,
                     onProgress: (p) => {
                       let nextText = '';
                       if (p.status === 'QUEUED') {
@@ -402,9 +406,14 @@ export class BearDiscordBot {
                         } else if (sourceFolderId && driveLinkOpt) {
                           targetFolderId = driveAuth.folderId;
                         }
-                        const mimeType = outputFileName.toLowerCase().endsWith('.png')
-                          ? 'image/png'
-                          : 'application/zip';
+                        const lowerOut = outputFileName.toLowerCase();
+                        const mimeType = lowerOut.endsWith('.jpg') || lowerOut.endsWith('.jpeg')
+                          ? 'image/jpeg'
+                          : lowerOut.endsWith('.png')
+                            ? 'image/png'
+                            : lowerOut.endsWith('.psd')
+                              ? 'image/vnd.adobe.photoshop'
+                              : 'application/zip';
                         console.log(`[Bot] Streaming ${outputFileName} (${(fileSize / 1048576).toFixed(1)}MB) to Google Drive...`);
                         const up = await uploadToDrive({
                           accessToken: driveAuth.accessToken,
@@ -433,9 +442,14 @@ export class BearDiscordBot {
 
                   if (shouldUploadGofile) {
                     try {
-                      const mimeType = outputFileName.toLowerCase().endsWith('.png')
-                        ? 'image/png'
-                        : 'application/zip';
+                      const lowerOut2 = outputFileName.toLowerCase();
+                      const mimeType = lowerOut2.endsWith('.jpg') || lowerOut2.endsWith('.jpeg')
+                        ? 'image/jpeg'
+                        : lowerOut2.endsWith('.png')
+                          ? 'image/png'
+                          : lowerOut2.endsWith('.psd')
+                            ? 'image/vnd.adobe.photoshop'
+                            : 'application/zip';
                       console.log(`[Bot] Streaming ${outputFileName} (${(fileSize / 1048576).toFixed(1)}MB) to Gofile...`);
                       uploadedGofileLink = await uploadToGofile({
                         filePath: outputPath,
@@ -772,6 +786,17 @@ export class BearDiscordBot {
           opt
             .setName('chapter')
             .setDescription('Mounted chapter ID (chapter1, chapter2, chapter3)')
+            .setRequired(false)
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName('output_format')
+            .setDescription('صيغة الخرج: JPG خفيف (بدون PSD) أو PNG أو ملفات PSD بطبقتين')
+            .addChoices(
+              { name: 'JPG خفيف — تبييض بس بدون PSD (مساحة صغيرة)', value: 'jpg' },
+              { name: 'PNG — تبييض بس بدون PSD (بدون ضغط)', value: 'png' },
+              { name: 'PSD — ملفات فوتوشوب بطبقتين (الأصلية + التبييض)', value: 'psd' }
+            )
             .setRequired(false)
         )
         .addStringOption((opt) =>

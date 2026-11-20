@@ -12,6 +12,7 @@ import {
 } from '../engine/onnxPipeline';
 import { detectRegionsInRgbaBuffer, measureSurroundRing } from '../engine/detector';
 import { CleaningSettings, DetectedRegion } from '../engine/types';
+import { createTwoLayerPsd } from '../engine/psdWriter';
 
 sharp.cache(false);
 sharp.concurrency(1);
@@ -25,6 +26,7 @@ interface BatchManifest {
     scratchDir: string;
   }[];
   settings: CleaningSettings;
+  outputFormat?: 'jpg' | 'png' | 'psd';
 }
 
 async function runCtdBatch(manifest: BatchManifest) {
@@ -105,9 +107,7 @@ async function runRtdetrBatch(manifest: BatchManifest) {
 
     fs.writeFileSync(path.join(p.scratchDir, 'regions.json'), JSON.stringify(regions), 'utf-8');
     clearPageCtdCache();
-    // Free CTD mask immediately after RT-DETR fusion
-    fs.promises.unlink(maskPath).catch(() => {});
-    fs.promises.unlink(ctdMetaPath).catch(() => {});
+    // Keep ctd_mask.bin & ctd_meta.json for Stage 3 (CLEAN/LaMa) so LaMa gets pixel-exact text masks!
 
     console.log(
       `PROGRESS:DETECTING_RTDETR:${p.index + 1}:${manifest.pages.length}`
@@ -129,6 +129,28 @@ async function runCleanBatch(manifest: BatchManifest) {
     const height = meta.height || 1200;
     const rawBuffer = await image.ensureAlpha().raw().toBuffer();
     const rgba = new Uint8Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+
+    // Restore pixel-exact CTD segmentation mask for Stage 3 (eliminates halos & muddy LaMa patches!)
+    const maskPath = path.join(p.scratchDir, 'ctd_mask.bin');
+    const ctdMetaPath = path.join(p.scratchDir, 'ctd_meta.json');
+    if (fs.existsSync(maskPath) && fs.existsSync(ctdMetaPath)) {
+      const ctdMeta = JSON.parse(fs.readFileSync(ctdMetaPath, 'utf-8')) as {
+        width: number;
+        height: number;
+        fingerprint: number;
+        blkBoxes: { bbox: { x: number; y: number; w: number; h: number }; score: number }[];
+      };
+      const maskBuf = fs.readFileSync(maskPath);
+      setCachedPageCtd({
+        width: ctdMeta.width,
+        height: ctdMeta.height,
+        fingerprint: ctdMeta.fingerprint,
+        segMask: new Uint8Array(maskBuf.buffer, maskBuf.byteOffset, maskBuf.byteLength),
+        blkBoxes: ctdMeta.blkBoxes || [],
+      });
+    } else {
+      clearPageCtdCache();
+    }
 
     const regionsPath = path.join(p.scratchDir, 'regions.json');
     const regions = fs.existsSync(regionsPath)
@@ -189,14 +211,34 @@ async function runCleanBatch(manifest: BatchManifest) {
       cleanedCount++;
     }
 
-    await sharp(Buffer.from(workRgba.buffer, workRgba.byteOffset, workRgba.byteLength), {
-      raw: { width, height, channels: 4 },
-      limitInputPixels: false,
-    })
-      .png({ compressionLevel: 6 })
-      .toFile(p.outPath);
+    const fmt = manifest.outputFormat || 'jpg';
+    if (fmt === 'psd') {
+      const psdBuf = createTwoLayerPsd({
+        width,
+        height,
+        originalRgba: rgba,
+        cleanedRgba: workRgba,
+      });
+      await fs.promises.writeFile(p.outPath, psdBuf);
+    } else if (fmt === 'jpg') {
+      await sharp(Buffer.from(workRgba.buffer, workRgba.byteOffset, workRgba.byteLength), {
+        raw: { width, height, channels: 4 },
+        limitInputPixels: false,
+      })
+        .flatten({ background: '#ffffff' })
+        .jpeg({ quality: 92, mozjpeg: true })
+        .toFile(p.outPath);
+    } else {
+      await sharp(Buffer.from(workRgba.buffer, workRgba.byteOffset, workRgba.byteLength), {
+        raw: { width, height, channels: 4 },
+        limitInputPixels: false,
+      })
+        .png({ compressionLevel: 6 })
+        .toFile(p.outPath);
+    }
 
     totalCleaned += cleanedCount;
+    clearPageCtdCache();
     fs.promises.rm(p.scratchDir, { recursive: true, force: true }).catch(() => {});
     fs.promises.unlink(p.inPath).catch(() => {});
 

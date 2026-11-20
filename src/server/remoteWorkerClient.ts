@@ -19,6 +19,7 @@ export interface RemoteCleanRequest {
   buffer: Buffer;
   cleanSfx: boolean;
   bubbleCleanMode?: BubbleCleanMode;
+  outputFormat?: 'jpg' | 'png' | 'psd';
   onProgress?: (progress: RemoteJobProgress) => void;
 }
 
@@ -58,6 +59,9 @@ export async function cleanWithRemoteWorker(req: RemoteCleanRequest): Promise<Re
   form.append('clean_sfx', req.cleanSfx ? 'true' : 'false');
   if (req.bubbleCleanMode) {
     form.append('bubble_mode', req.bubbleCleanMode);
+  }
+  if (req.outputFormat) {
+    form.append('output_format', req.outputFormat);
   }
 
   const submitRes = await fetch(`${baseUrl}/worker/jobs`, {

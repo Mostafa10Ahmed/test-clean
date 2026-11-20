@@ -428,9 +428,9 @@ export async function computePageCtdSegMask(
       const blkData = blkTensor.data;
       for (let i = 0; i < blkData.length; i += 7) {
         const obj = blkData[i + 4];
-        if (obj < 0.35) continue;
+        if (obj < 0.28) continue;
         const score = obj * Math.max(blkData[i + 5], blkData[i + 6]);
-        if (score < 0.42) continue;
+        if (score < 0.34) continue;
         const cx = blkData[i];
         const cy = blkData[i + 1];
         const bw = blkData[i + 2];
@@ -529,7 +529,7 @@ function extractCtdComponents(
     const gRow = gy * gw;
     for (let x = 0; x < imgWidth; x++) {
       const v = ctdSegMask[rowOff + x];
-      if (v >= 70) {
+      if (v >= 55) {
         const gx = x >> 1;
         grid[gRow + gx] = 1;
         if (v > gridConf[gRow + gx]) gridConf[gRow + gx] = v;
@@ -758,7 +758,7 @@ export async function detectRegionsWithOnnx(
     for (let i = 0; i < scores.length; i++) {
       const score = scores[i];
       const label = Number(labels[i]);
-      const minScore = label === 0 ? 0.40 : label === 1 ? 0.33 : 0.35;
+      const minScore = label === 0 ? 0.36 : label === 1 ? 0.27 : 0.28;
       if (score < minScore) continue;
 
       const x1 = Math.max(0, Math.round(boxes[i * 4]));
@@ -1048,7 +1048,7 @@ export async function detectRegionsWithOnnx(
       category = 'BUBBLE';
     } else if (
       isGiantStylizedSfx ||
-      (!surroundStats.isUniform && (surroundStats.edgeEnergy > 38 || bbox.w * bbox.h > 14000))
+      (!surroundStats.isUniform && surroundStats.edgeEnergy > 58 && bbox.w * bbox.h > 26000)
     ) {
       category = 'SFX';
     } else if (isNearPageSide || (aspect < 0.48 && bbox.w <= 84)) {

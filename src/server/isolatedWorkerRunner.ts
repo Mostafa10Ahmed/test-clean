@@ -100,6 +100,7 @@ export async function runIsolatedWorkerJob(params: {
   originalName: string;
   cleanSfx: boolean;
   bubbleCleanMode?: BubbleCleanMode;
+  outputFormat?: 'jpg' | 'png' | 'psd';
   baseSettings: CleaningSettings;
   onProgress?: (p: IsolatedJobProgress) => void;
 }): Promise<IsolatedJobResult> {
@@ -145,16 +146,18 @@ export async function runIsolatedWorkerJob(params: {
     throw new Error('No valid PNG/JPG/WebP images found in upload');
   }
 
+  const outputFormat: 'jpg' | 'png' | 'psd' = params.outputFormat || 'jpg';
+  const ext = outputFormat === 'psd' ? 'psd' : outputFormat === 'png' ? 'png' : 'jpg';
   const pages = pageNames.map((name, index) => ({
     index,
     name,
     inPath: path.join(inDir, name),
-    outPath: path.join(outDir, `${name.replace(/\.[^.]+$/, '')}_cleaned.png`),
+    outPath: path.join(outDir, `${name.replace(/\.[^.]+$/, '')}_cleaned.${ext}`),
     scratchDir: path.join(scratchDir, `p_${index}`),
   }));
 
   const manifestPath = path.join(jobRoot, 'manifest.json');
-  fs.writeFileSync(manifestPath, JSON.stringify({ pages, settings }), 'utf-8');
+  fs.writeFileSync(manifestPath, JSON.stringify({ pages, settings, outputFormat }), 'utf-8');
 
   // Stage 1 (BATCH): CTD loads ONCE for entire chapter, then exits (100% RAM reclaimed!)
   if (process.env.ENABLE_CTD !== '0' && process.env.ENABLE_CTD !== 'false') {

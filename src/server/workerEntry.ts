@@ -22,6 +22,9 @@ const DEFAULT_WORKER_SETTINGS: CleaningSettings = {
   strictQualityGate: true,
   maxStripWindowHeight: 2048,
   autoReviewFlagSfx: true,
+  defaultPaddingPx: 6,
+  defaultFeatherPx: 3,
+  preserveColoredBubbles: true,
 };
 
 interface WorkerJobRecord {
@@ -94,6 +97,9 @@ app.post('/worker/jobs', workerDiskUpload.single('file'), (req, res) => {
   const rawMode = String(req.body?.bubble_mode || '').toUpperCase();
   const bubbleCleanMode: BubbleCleanMode | undefined =
     rawMode === 'TEXT_ONLY' ? 'TEXT_ONLY' : rawMode === 'WHITEN' ? 'WHITEN' : undefined;
+  const rawFmt = String(req.body?.output_format || 'jpg').toLowerCase();
+  const outputFormat: 'jpg' | 'png' | 'psd' =
+    rawFmt === 'psd' ? 'psd' : rawFmt === 'png' ? 'png' : 'jpg';
 
   const jobId = `wjob_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const record: WorkerJobRecord = {
@@ -135,6 +141,7 @@ app.post('/worker/jobs', workerDiskUpload.single('file'), (req, res) => {
         originalName: origName,
         cleanSfx,
         bubbleCleanMode,
+        outputFormat,
         baseSettings: DEFAULT_WORKER_SETTINGS,
         onProgress: (p) => {
           record.stage = p.stage;
