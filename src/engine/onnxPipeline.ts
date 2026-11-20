@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import type * as OrtTypes from 'onnxruntime-node';
 
@@ -33,7 +34,7 @@ const MODELS_DIR = process.env.MODEL_DIR
   ? path.resolve(process.env.MODEL_DIR)
   : path.resolve(process.cwd(), 'models');
 const LOW_RAM_MODE = process.env.LOW_RAM_MODE !== '0' && process.env.LOW_RAM_MODE !== 'false';
-const ONNX_THREADS = Math.max(1, Number(process.env.ONNX_THREADS) || (LOW_RAM_MODE ? 1 : 4));
+const ONNX_THREADS = Math.max(1, Number(process.env.ONNX_THREADS) || Math.min(4, Math.max(2, os.cpus().length)));
 const ENABLE_CTD = process.env.ENABLE_CTD !== '0' && process.env.ENABLE_CTD !== 'false';
 const ENABLE_LAMA = process.env.ENABLE_LAMA !== '0' && process.env.ENABLE_LAMA !== 'false';
 const RTDETR_MODEL_PATH = path.join(MODELS_DIR, 'detector-v4-s_int8.onnx');
@@ -108,7 +109,7 @@ export async function getRtdetrSession(): Promise<OrtTypes.InferenceSession | nu
         interOpNumThreads: 1,
         enableCpuMemArena: !LOW_RAM_MODE,
         enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: LOW_RAM_MODE ? 'basic' : 'all',
+        graphOptimizationLevel: LOW_RAM_MODE ? 'extended' : 'all',
       });
     })().catch((err) => {
       console.error('Failed to load detector-v4-s_int8.onnx:', err);
@@ -130,7 +131,7 @@ export async function getCtdSession(): Promise<OrtTypes.InferenceSession | null>
         interOpNumThreads: 1,
         enableCpuMemArena: !LOW_RAM_MODE,
         enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: LOW_RAM_MODE ? 'basic' : 'all',
+        graphOptimizationLevel: LOW_RAM_MODE ? 'extended' : 'all',
       });
     })().catch((err) => {
       console.error('Failed to load comictextdetector.pt.onnx:', err);
@@ -210,7 +211,7 @@ export async function getLamaSession(): Promise<OrtTypes.InferenceSession | null
         interOpNumThreads: 1,
         enableCpuMemArena: !LOW_RAM_MODE,
         enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: LOW_RAM_MODE ? 'basic' : 'all',
+        graphOptimizationLevel: LOW_RAM_MODE ? 'extended' : 'all',
       });
     })().catch((err) => {
       console.error('Failed to load lama-manga.onnx:', err);

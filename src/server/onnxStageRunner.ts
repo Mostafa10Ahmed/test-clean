@@ -226,14 +226,14 @@ async function runCleanBatch(manifest: BatchManifest) {
         limitInputPixels: false,
       })
         .flatten({ background: '#ffffff' })
-        .jpeg({ quality: 92, mozjpeg: true })
+        .jpeg({ quality: 91, mozjpeg: false })
         .toFile(p.outPath);
     } else {
       await sharp(Buffer.from(workRgba.buffer, workRgba.byteOffset, workRgba.byteLength), {
         raw: { width, height, channels: 4 },
         limitInputPixels: false,
       })
-        .png({ compressionLevel: 6 })
+        .png({ compressionLevel: 3 })
         .toFile(p.outPath);
     }
 
