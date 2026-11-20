@@ -1,17 +1,19 @@
+import fs from 'fs';
+
 const GOFILE_UPLOAD_URL = 'https://upload.gofile.io/uploadfile';
 
 export async function uploadToGofile(params: {
-  buffer: Buffer;
+  filePath: string;
   fileName: string;
   mimeType?: string;
 }): Promise<string> {
   const token = (process.env.GOFILE_TOKEN || '').trim();
   const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
 
-  const form = new FormData();
-  const blob = new Blob([new Uint8Array(params.buffer)], {
+  const blob = await fs.openAsBlob(params.filePath, {
     type: params.mimeType || 'application/octet-stream',
   });
+  const form = new FormData();
   form.append('file', blob, params.fileName);
 
   const resp = await fetch(GOFILE_UPLOAD_URL, {

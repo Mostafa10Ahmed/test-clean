@@ -402,15 +402,15 @@ export class BearDiscordBot {
                         } else if (sourceFolderId && driveLinkOpt) {
                           targetFolderId = driveAuth.folderId;
                         }
-                        const outBuf = await fs.promises.readFile(outputPath);
                         const mimeType = outputFileName.toLowerCase().endsWith('.png')
                           ? 'image/png'
                           : 'application/zip';
+                        console.log(`[Bot] Streaming ${outputFileName} (${(fileSize / 1048576).toFixed(1)}MB) to Google Drive...`);
                         const up = await uploadToDrive({
                           accessToken: driveAuth.accessToken,
                           parentFolderId: targetFolderId,
                           fileName: outputFileName,
-                          buffer: outBuf,
+                          filePath: outputPath,
                           mimeType,
                         });
                         uploadedDriveLink = up.webViewLink;
@@ -433,12 +433,12 @@ export class BearDiscordBot {
 
                   if (shouldUploadGofile) {
                     try {
-                      const outBuf = await fs.promises.readFile(outputPath);
                       const mimeType = outputFileName.toLowerCase().endsWith('.png')
                         ? 'image/png'
                         : 'application/zip';
+                      console.log(`[Bot] Streaming ${outputFileName} (${(fileSize / 1048576).toFixed(1)}MB) to Gofile...`);
                       uploadedGofileLink = await uploadToGofile({
-                        buffer: outBuf,
+                        filePath: outputPath,
                         fileName: outputFileName,
                         mimeType,
                       });

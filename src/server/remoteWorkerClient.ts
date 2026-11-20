@@ -1,4 +1,6 @@
 import fs from 'fs';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 import os from 'os';
 import path from 'path';
 import { BubbleCleanMode } from '../engine/types';
@@ -152,12 +154,19 @@ export async function cleanWithRemoteWorker(req: RemoteCleanRequest): Promise<Re
     throw new Error(`Worker result download failed (${downloadRes.status}): ${errText.slice(0, 200)}`);
   }
 
-  const outBuf = Buffer.from(await downloadRes.arrayBuffer());
   const tmpDir = path.join(os.tmpdir(), 'bearbot-remote-results');
   fs.mkdirSync(tmpDir, { recursive: true });
   const outputFileName = statusPayload.outputFileName || `${jobId}_cleaned.zip`;
   const outputPath = path.join(tmpDir, `${jobId}_${path.basename(outputFileName)}`);
-  fs.writeFileSync(outputPath, outBuf);
+  if (downloadRes.body) {
+    await pipeline(
+      Readable.fromWeb(downloadRes.body as unknown as import('stream/web').ReadableStream),
+      fs.createWriteStream(outputPath)
+    );
+  } else {
+    const outBuf = Buffer.from(await downloadRes.arrayBuffer());
+    await fs.promises.writeFile(outputPath, outBuf);
+  }
 
   return {
     jobId,

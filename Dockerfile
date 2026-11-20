@@ -18,4 +18,4 @@ ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
 
-CMD ["sh", "-c", "if [ \"$WORKER_MODE\" = \"1\" ] || [ \"$WORKER_MODE\" = \"true\" ]; then exec node --max-old-space-size=128 dist-server/workerEntry.mjs; else exec node --max-old-space-size=384 dist-server/server.mjs; fi"]
+CMD ["sh", "-c", "if [ \"$WORKER_MODE\" = \"1\" ] || [ \"$WORKER_MODE\" = \"true\" ]; then exec node --max-old-space-size=128 dist-server/workerEntry.mjs; else exec node --max-old-space-size=512 dist-server/server.mjs; fi"]

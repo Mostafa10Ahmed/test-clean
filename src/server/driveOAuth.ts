@@ -655,35 +655,47 @@ export async function uploadToDrive(params: {
   accessToken: string;
   parentFolderId: string;
   fileName: string;
-  buffer: Buffer;
+  filePath: string;
   mimeType: string;
 }): Promise<{ fileId: string; webViewLink: string }> {
-  const boundary = `bearbot_${crypto.randomBytes(12).toString('hex')}`;
-  const metadata = JSON.stringify({
-    name: params.fileName,
-    parents: [params.parentFolderId],
-  });
+  const stat = await fs.promises.stat(params.filePath);
 
-  const head = Buffer.from(
-    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
-      `--${boundary}\r\nContent-Type: ${params.mimeType}\r\n\r\n`,
-    'utf-8'
-  );
-  const tail = Buffer.from(`\r\n--${boundary}--`, 'utf-8');
-  const body = Buffer.concat([head, params.buffer, tail]);
-
-  const upRes = await fetch(
-    `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name,webViewLink&supportsAllDrives=true`,
+  // Step 1: Initiate Google Drive Resumable Upload session (zero RAM buffering!)
+  const initRes = await fetch(
+    `${DRIVE_UPLOAD_API}/files?uploadType=resumable&fields=id,name,webViewLink&supportsAllDrives=true`,
     {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${params.accessToken}`,
-        'Content-Type': `multipart/related; boundary=${boundary}`,
-        'Content-Length': String(body.byteLength),
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': params.mimeType,
+        'X-Upload-Content-Length': String(stat.size),
       },
-      body,
+      body: JSON.stringify({
+        name: params.fileName,
+        parents: [params.parentFolderId],
+      }),
     }
   );
+  if (!initRes.ok) {
+    const errTxt = await initRes.text().catch(() => '');
+    throw new Error(`فشل تهيئة رفع Google Drive (${initRes.status}): ${errTxt.slice(0, 180)}`);
+  }
+  const uploadUrl = initRes.headers.get('location');
+  if (!uploadUrl) {
+    throw new Error('Google Drive لم يرجّع رابط الرفع (Location header missing)');
+  }
+
+  // Step 2: Stream file directly from disk via fs.openAsBlob
+  const fileBlob = await fs.openAsBlob(params.filePath, { type: params.mimeType });
+  const upRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': params.mimeType,
+      'Content-Length': String(stat.size),
+    },
+    body: fileBlob,
+  });
   if (!upRes.ok) {
     const errTxt = await upRes.text().catch(() => '');
     throw new Error(`فشل رفع النتيجة على Google Drive (${upRes.status}): ${errTxt.slice(0, 180)}`);
