@@ -1,6 +1,0 @@
-[
-  "test_worker.py::test_health",
-  "test_worker.py::test_rejects_unknown_profile",
-  "test_worker.py::test_rejects_wrong_token",
-  "test_worker.py::test_returns_cleaned_zip"
-]
