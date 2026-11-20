@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import type * as OrtTypes from 'onnxruntime-node';
@@ -34,7 +34,9 @@ const MODELS_DIR = process.env.MODEL_DIR
   : path.resolve(process.cwd(), 'models');
 const LOW_RAM_MODE = process.env.LOW_RAM_MODE !== '0' && process.env.LOW_RAM_MODE !== 'false';
 const ONNX_THREADS = Math.max(1, Number(process.env.ONNX_THREADS) || (LOW_RAM_MODE ? 2 : 4));
-const ENABLE_LAMA = process.env.ENABLE_LAMA !== '0' && process.env.ENABLE_LAMA !== 'false';
+const ENABLE_LAMA = process.env.ENABLE_LAMA
+  ? process.env.ENABLE_LAMA === '1' || process.env.ENABLE_LAMA === 'true'
+  : !LOW_RAM_MODE;
 const RTDETR_MODEL_PATH = path.join(MODELS_DIR, 'detector-v4-s_int8.onnx');
 const CTD_MODEL_PATH = path.join(MODELS_DIR, 'comictextdetector.pt.onnx');
 const LAMA_MODEL_PATH = path.join(MODELS_DIR, 'lama-manga.onnx');
@@ -75,7 +77,15 @@ async function ensureModelDownloaded(filePath: string, url: string): Promise<boo
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     const tmpPath = `${filePath}.part_${Date.now()}`;
-    execFileSync('curl', ['-L', '-sS', '-o', tmpPath, url], { stdio: 'ignore' });
+    console.log(`[ONNX] Downloading ${path.basename(filePath)}...`);
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn('curl', ['-L', '-sS', '--fail', '-o', tmpPath, url], { stdio: 'ignore' });
+      child.on('error', reject);
+      child.on('close', (code) =>
+        code === 0 ? resolve() : reject(new Error(`curl exited with code ${code}`))
+      );
+    });
+    console.log(`[ONNX] Downloaded ${path.basename(filePath)} (${(fs.statSync(tmpPath).size / 1048576).toFixed(1)} MB)`);
     if (fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 1024 * 1024) {
       fs.renameSync(tmpPath, filePath);
       return true;
@@ -164,7 +174,12 @@ export async function releaseLamaSession(): Promise<void> {
   await releaseSessionPromise(p);
 }
 
+export function clearPageCtdCache(): void {
+  cachedPageCtd = null;
+}
+
 export async function releaseAllOnnxSessions(): Promise<void> {
+  cachedPageCtd = null;
   await releaseCtdSession();
   await releaseRtdetrSession();
   await releaseLamaSession();

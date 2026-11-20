@@ -107,8 +107,10 @@ async function startServer() {
     const diskPath = uploaded.path;
     const origName = uploaded.originalname || 'chapter.zip';
 
+    console.log(`[Worker] Queued ${jobId} (${origName}, ${(uploaded.size / 1048576).toFixed(2)} MB) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
     workerQueueChain = workerQueueChain.then(async () => {
       record.status = 'PROCESSING';
+      console.log(`[Worker] Starting ${jobId} (${origName}, clean_sfx=${cleanSfx}) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
       try {
         const buf = await fs.promises.readFile(diskPath);
         await fs.promises.unlink(diskPath).catch(() => {});
@@ -135,7 +137,9 @@ async function startServer() {
           throw new Error('Worker finished job without producing output file');
         }
         record.status = 'COMPLETED';
+        console.log(`[Worker] Completed ${jobId} (${record.totalPages} pages, ${record.cleanedRegions} regions) | RSS=${(process.memoryUsage().rss / 1048576).toFixed(1)}MB`);
       } catch (err) {
+        console.error(`[Worker] Failed ${jobId}:`, err);
         await fs.promises.unlink(diskPath).catch(() => {});
         record.status = 'FAILED';
         record.error = (err as Error).message;

@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import sharp from 'sharp';
+sharp.cache(false);
+sharp.concurrency(1);
 import JSZip from 'jszip';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
@@ -371,7 +373,11 @@ export class ChapterCleaningManager {
       cleanedUrl = `/cleaned/${job.id}/${outPngName}?v=${Date.now()}`;
     }
 
+    if (process.env.LOW_RAM_MODE !== '0') {
+      clearPageCtdCache();
+    }
     const memUsageMb = Number((process.memoryUsage().rss / 1024 / 1024).toFixed(1));
+    console.log(`[Cleaner] Page ${pageIndex + 1}/${job.totalPages} (${page.fileName}) done in ${Math.round(performance.now() - t0)}ms | RSS=${memUsageMb}MB`);
     const elapsedMs = Math.round(performance.now() - t0);
 
     const updatedPage: PageProcessResult = {
@@ -964,7 +970,7 @@ export class ChapterCleaningManager {
     const jobDir = path.join(UPLOADS_DIR, jobId);
     fs.mkdirSync(jobDir, { recursive: true });
 
-    const extractedImages: { name: string; buf: Buffer }[] = [];
+    const savedFileNames: string[] = [];
 
     for (const f of files) {
       if (f.originalname.toLowerCase().endsWith('.zip')) {
@@ -975,37 +981,40 @@ export class ChapterCleaningManager {
         for (const entryName of sortPageNamesNaturally(entries)) {
           const base = path.basename(entryName);
           const content = await zip.files[entryName].async('nodebuffer');
-          extractedImages.push({ name: base, buf: content });
+          fs.writeFileSync(path.join(jobDir, base), content);
+          savedFileNames.push(base);
         }
       } else if (/\.(jpg|jpeg|png|webp)$/i.test(f.originalname)) {
-        extractedImages.push({ name: f.originalname, buf: f.buffer });
+        const base = path.basename(f.originalname);
+        fs.writeFileSync(path.join(jobDir, base), f.buffer);
+        savedFileNames.push(base);
       }
     }
 
-    if (extractedImages.length === 0) {
+    if (savedFileNames.length === 0) {
       throw new Error('No valid PNG/JPG/WebP images found in upload');
     }
 
-    const sortedNames = sortPageNamesNaturally(extractedImages.map((x) => x.name));
+    const sortedNames = sortPageNamesNaturally(savedFileNames);
     const pages: PageProcessResult[] = [];
 
     for (let i = 0; i < sortedNames.length; i++) {
-      const item = extractedImages.find((x) => x.name === sortedNames[i])!;
-      const filePath = path.join(jobDir, item.name);
-      fs.writeFileSync(filePath, item.buf);
-      const meta = await sharp(item.buf, { limitInputPixels: false }).metadata();
+      const fileName = sortedNames[i];
+      const filePath = path.join(jobDir, fileName);
+      const stat = fs.statSync(filePath);
+      const meta = await sharp(filePath, { limitInputPixels: false }).metadata();
       pages.push({
         pageIndex: i,
-        fileName: item.name,
+        fileName,
         width: meta.width || 800,
         height: meta.height || 1200,
         format: meta.format || 'png',
-        fileSizeBytes: item.buf.byteLength,
+        fileSizeBytes: stat.size,
         stripWindowCount: computeStripWindows(meta.height || 1200, 2048, 128).length,
         processingTimeMs: 0,
         peakMemoryMb: 0,
-        originalUrl: `/uploads/${jobId}/${item.name}`,
-        cleanedUrl: `/uploads/${jobId}/${item.name}`,
+        originalUrl: `/uploads/${jobId}/${fileName}`,
+        cleanedUrl: `/uploads/${jobId}/${fileName}`,
         regions: [],
         status: 'PENDING',
         untouchedPixelsBitIdentical: true,
