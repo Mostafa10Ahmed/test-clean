@@ -1,26 +1,197 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import os from 'os';
 import express from 'express';
 import multer from 'multer';
 import path from 'path';
+import { BubbleCleanMode } from './src/engine/types';
+
+// Load .env and fallback to legacy 'env' file without overriding Railway environment variables
+dotenv.config({ path: '.env', override: false });
+if (fs.existsSync(path.resolve(process.cwd(), 'env'))) {
+  dotenv.config({ path: 'env', override: false });
+}
 import { createServer as createViteServer } from 'vite';
 import { ChapterCleaningManager } from './src/server/chapterProcessor';
 import { BearDiscordBot } from './src/server/discordBot';
+import { handleOAuthCallback } from './src/server/driveOAuth';
 import { buildTestCleanRepoZip } from './src/server/repoExporter';
+
+const uploadTmpDir = path.join(os.tmpdir(), 'bearbot-uploads');
+fs.mkdirSync(uploadTmpDir, { recursive: true });
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 150 * 1024 * 1024 }, // 150MB max chapter ZIP upload
 });
 
+const workerDiskUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadTmpDir),
+    filename: (_req, file, cb) => cb(null, `${Date.now()}_${path.basename(file.originalname)}`),
+  }),
+  limits: { fileSize: 150 * 1024 * 1024 },
+});
+
+interface WorkerJobRecord {
+  jobId: string;
+  status: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  totalPages: number;
+  processedPages: number;
+  cleanedRegions: number;
+  totalProcessingTimeMs: number;
+  bubbleCleanMode: BubbleCleanMode;
+  outputPath?: string;
+  outputFileName?: string;
+  error?: string;
+  createdAt: number;
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || process.env.DEFAULT_APP_PORT) || 3000;
+  const isWorkerMode = process.env.WORKER_MODE === '1' || process.env.WORKER_MODE === 'true';
 
   app.use(express.json({ limit: '25mb' }));
 
   const manager = new ChapterCleaningManager();
-  const discordBot = new BearDiscordBot(manager);
-  discordBot.startIfConfigured().catch(console.error);
+  const discordBot = isWorkerMode ? null : new BearDiscordBot(manager);
+  if (discordBot) {
+    discordBot.startIfConfigured().catch(console.error);
+  }
+
+  // --- WORKER ASYNC JOB QUEUE (1-at-a-time FIFO to stay safe on 1GB RAM) ---
+  const workerJobs = new Map<string, WorkerJobRecord>();
+  let workerQueueChain: Promise<void> = Promise.resolve();
+
+  const checkWorkerAuth = (req: express.Request, res: express.Response): boolean => {
+    const expected = (process.env.WORKER_TOKEN || '').trim();
+    if (!expected) return true;
+    const auth = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    const headerTok = String(req.headers['x-worker-token'] || '').trim();
+    if (auth === expected || headerTok === expected) return true;
+    res.status(401).json({ error: 'Unauthorized worker token' });
+    return false;
+  };
+
+  app.get('/health', (_req, res) => {
+    res.json({ ok: true, status: 'ready', mode: isWorkerMode ? 'worker' : 'bot' });
+  });
+
+  app.post('/worker/jobs', workerDiskUpload.single('file'), (req, res) => {
+    if (!checkWorkerAuth(req, res)) return;
+    const uploaded = req.file;
+    if (!uploaded) {
+      res.status(400).json({ error: 'Missing file upload' });
+      return;
+    }
+
+    const cleanSfx = String(req.body?.clean_sfx || 'false').toLowerCase() === 'true';
+    const rawMode = String(req.body?.bubble_mode || '').toUpperCase();
+    const bubbleCleanMode: BubbleCleanMode | undefined =
+      rawMode === 'TEXT_ONLY' ? 'TEXT_ONLY' : rawMode === 'WHITEN' ? 'WHITEN' : undefined;
+
+    const jobId = `wjob_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const record: WorkerJobRecord = {
+      jobId,
+      status: 'QUEUED',
+      totalPages: 0,
+      processedPages: 0,
+      cleanedRegions: 0,
+      totalProcessingTimeMs: 0,
+      bubbleCleanMode: bubbleCleanMode || 'WHITEN',
+      createdAt: Date.now(),
+    };
+    workerJobs.set(jobId, record);
+
+    const diskPath = uploaded.path;
+    const origName = uploaded.originalname || 'chapter.zip';
+
+    workerQueueChain = workerQueueChain.then(async () => {
+      record.status = 'PROCESSING';
+      try {
+        const buf = await fs.promises.readFile(diskPath);
+        await fs.promises.unlink(diskPath).catch(() => {});
+
+        const job = await manager.ingestUploadedFiles(
+          [{ originalname: origName, buffer: buf }],
+          `Worker: ${origName}`,
+          { enableSFX: cleanSfx, bubbleCleanMode }
+        );
+
+        record.totalPages = job.totalPages;
+        record.processedPages = job.processedPages;
+        record.cleanedRegions = job.cleanedRegions;
+        record.totalProcessingTimeMs = job.totalProcessingTimeMs;
+        record.bubbleCleanMode = job.settings.bubbleCleanMode;
+
+        if (job.pages.length === 1 && job.pages[0].cleanedUrl) {
+          record.outputPath = manager.resolveDiskPathFromUrl(job.pages[0].cleanedUrl);
+          record.outputFileName = `${job.pages[0].fileName.replace(/\.[^.]+$/, '')}_cleaned.png`;
+        } else if (job.zipDownloadUrl) {
+          record.outputPath = manager.resolveDiskPathFromUrl(job.zipDownloadUrl);
+          record.outputFileName = `${job.id}_cleaned.zip`;
+        } else {
+          throw new Error('Worker finished job without producing output file');
+        }
+        record.status = 'COMPLETED';
+      } catch (err) {
+        await fs.promises.unlink(diskPath).catch(() => {});
+        record.status = 'FAILED';
+        record.error = (err as Error).message;
+      }
+    });
+
+    // Prune completed/failed job metadata older than 1 hour
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const [k, v] of workerJobs.entries()) {
+      if (v.createdAt < cutoff && (v.status === 'COMPLETED' || v.status === 'FAILED')) {
+        workerJobs.delete(k);
+      }
+    }
+
+    res.status(202).json({ jobId, status: record.status });
+  });
+
+  app.get('/worker/jobs/:id', (req, res) => {
+    if (!checkWorkerAuth(req, res)) return;
+    const rec = workerJobs.get(req.params.id);
+    if (!rec) {
+      res.status(404).json({ error: 'Job not found' });
+      return;
+    }
+    res.json({
+      jobId: rec.jobId,
+      status: rec.status,
+      totalPages: rec.totalPages,
+      processedPages: rec.processedPages,
+      cleanedRegions: rec.cleanedRegions,
+      totalProcessingTimeMs: rec.totalProcessingTimeMs,
+      bubbleCleanMode: rec.bubbleCleanMode,
+      outputFileName: rec.outputFileName,
+      error: rec.error,
+    });
+  });
+
+  app.get('/worker/jobs/:id/result', (req, res) => {
+    if (!checkWorkerAuth(req, res)) return;
+    const rec = workerJobs.get(req.params.id);
+    if (!rec || rec.status !== 'COMPLETED' || !rec.outputPath || !fs.existsSync(rec.outputPath)) {
+      res.status(404).json({ error: 'Job result not ready' });
+      return;
+    }
+    res.download(rec.outputPath, rec.outputFileName || 'cleaned_output');
+  });
+
+  if (isWorkerMode) {
+    app.get('/api/health', (_req, res) => {
+      res.json({ ok: true, status: 'ready', mode: 'worker' });
+    });
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`BearBot WORKER Server listening on http://0.0.0.0:${PORT} (WORKER_MODE=1)`);
+    });
+    return;
+  }
 
   // Serve static files from public (test chapters, cleaned PNGs, ZIP exports)
   app.use(
@@ -38,7 +209,28 @@ async function startServer() {
   // --- API ROUTES ---
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, status: 'ready' });
+    res.json({ ok: true, status: 'ready', mode: 'bot' });
+  });
+
+  // Google Drive OAuth callback (for /profile Google Drive linking)
+  app.get('/oauth/callback', async (req, res) => {
+    const code = String(req.query.code || '');
+    const state = String(req.query.state || '');
+    if (!code || !state) {
+      res.status(400).send('<h3>Missing OAuth code or state. Please retry from /profile.</h3>');
+      return;
+    }
+    const result = await handleOAuthCallback(code, state);
+    const color = result.ok ? '#16a34a' : '#dc2626';
+    const title = result.ok ? '✅ تم ربط Google Drive بنجاح' : '❌ فشل ربط Google Drive';
+    res.status(result.ok ? 200 : 400).send(
+      `<!doctype html><html dir="rtl" lang="ar"><head><meta charset="utf-8"><title>${title}</title></head>` +
+        `<body style="font-family:system-ui,sans-serif;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;">` +
+        `<div style="max-width:480px;padding:32px;border-radius:16px;background:#1e293b;border:2px solid ${color};text-align:center;">` +
+        `<h2 style="margin-top:0;color:${color};">${title}</h2>` +
+        `<p style="line-height:1.7;">${result.message}</p>` +
+        `</div></body></html>`
+    );
   });
 
   // Get full application state (chapters, bot messages, settings, Discord gateway status)
@@ -47,7 +239,7 @@ async function startServer() {
       jobs: manager.getJobs(),
       messages: manager.getMessages(),
       settings: manager.getSettings(),
-      discordStatus: discordBot.getStatus(),
+      discordStatus: discordBot ? discordBot.getStatus() : { configured: false, connected: false, registeredCommands: [] },
     });
   });
 

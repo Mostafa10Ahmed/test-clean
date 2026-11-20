@@ -29,7 +29,12 @@ import {
   RegionCategory,
 } from './types';
 
-const MODELS_DIR = process.env.MODEL_DIR ? path.resolve(process.env.MODEL_DIR) : path.resolve(process.cwd(), 'models');
+const MODELS_DIR = process.env.MODEL_DIR
+  ? path.resolve(process.env.MODEL_DIR)
+  : path.resolve(process.cwd(), 'models');
+const LOW_RAM_MODE = process.env.LOW_RAM_MODE !== '0' && process.env.LOW_RAM_MODE !== 'false';
+const ONNX_THREADS = Math.max(1, Number(process.env.ONNX_THREADS) || (LOW_RAM_MODE ? 2 : 4));
+const ENABLE_LAMA = process.env.ENABLE_LAMA !== '0' && process.env.ENABLE_LAMA !== 'false';
 const RTDETR_MODEL_PATH = path.join(MODELS_DIR, 'detector-v4-s_int8.onnx');
 const CTD_MODEL_PATH = path.join(MODELS_DIR, 'comictextdetector.pt.onnx');
 const LAMA_MODEL_PATH = path.join(MODELS_DIR, 'lama-manga.onnx');
@@ -90,7 +95,10 @@ export async function getRtdetrSession(): Promise<OrtTypes.InferenceSession | nu
       if (!ok) return null;
       const ort = await getOrt();
       return await ort.InferenceSession.create(RTDETR_MODEL_PATH, {
-        intraOpNumThreads: 4,
+        intraOpNumThreads: ONNX_THREADS,
+        interOpNumThreads: 1,
+        enableCpuMemArena: !LOW_RAM_MODE,
+        enableMemPattern: !LOW_RAM_MODE,
         graphOptimizationLevel: 'all',
       });
     })().catch((err) => {
@@ -109,7 +117,10 @@ export async function getCtdSession(): Promise<OrtTypes.InferenceSession | null>
       if (!ok) return null;
       const ort = await getOrt();
       return await ort.InferenceSession.create(CTD_MODEL_PATH, {
-        intraOpNumThreads: 4,
+        intraOpNumThreads: ONNX_THREADS,
+        interOpNumThreads: 1,
+        enableCpuMemArena: !LOW_RAM_MODE,
+        enableMemPattern: !LOW_RAM_MODE,
         graphOptimizationLevel: 'all',
       });
     })().catch((err) => {
@@ -121,14 +132,62 @@ export async function getCtdSession(): Promise<OrtTypes.InferenceSession | null>
   return ctdSessionPromise;
 }
 
+async function releaseSessionPromise(
+  promise: Promise<OrtTypes.InferenceSession | null> | null
+): Promise<void> {
+  if (!promise) return;
+  try {
+    const sess = await promise;
+    if (sess && typeof (sess as unknown as { release?: () => Promise<void> }).release === 'function') {
+      await (sess as unknown as { release: () => Promise<void> }).release();
+    }
+  } catch {
+    // ignore release errors
+  }
+}
+
+export async function releaseCtdSession(): Promise<void> {
+  const p = ctdSessionPromise;
+  ctdSessionPromise = null;
+  await releaseSessionPromise(p);
+}
+
+export async function releaseRtdetrSession(): Promise<void> {
+  const p = rtdetrSessionPromise;
+  rtdetrSessionPromise = null;
+  await releaseSessionPromise(p);
+}
+
+export async function releaseLamaSession(): Promise<void> {
+  const p = lamaSessionPromise;
+  lamaSessionPromise = null;
+  await releaseSessionPromise(p);
+}
+
+export async function releaseAllOnnxSessions(): Promise<void> {
+  await releaseCtdSession();
+  await releaseRtdetrSession();
+  await releaseLamaSession();
+}
+
 export async function getLamaSession(): Promise<OrtTypes.InferenceSession | null> {
+  if (!ENABLE_LAMA) {
+    return null;
+  }
+  if (LOW_RAM_MODE) {
+    await releaseCtdSession();
+    await releaseRtdetrSession();
+  }
   if (!lamaSessionPromise) {
     lamaSessionPromise = (async () => {
       const ok = await ensureModelDownloaded(LAMA_MODEL_PATH, LAMA_MODEL_URL);
       if (!ok) return null;
       const ort = await getOrt();
       return await ort.InferenceSession.create(LAMA_MODEL_PATH, {
-        intraOpNumThreads: 4,
+        intraOpNumThreads: ONNX_THREADS,
+        interOpNumThreads: 1,
+        enableCpuMemArena: !LOW_RAM_MODE,
+        enableMemPattern: !LOW_RAM_MODE,
         graphOptimizationLevel: 'all',
       });
     })().catch((err) => {
@@ -586,10 +645,19 @@ export async function detectRegionsWithOnnx(
   pageIndex: number,
   settings: CleaningSettings
 ): Promise<DetectedRegion[]> {
-  const [session, pageCtdMask] = await Promise.all([
-    getRtdetrSession(),
-    computePageCtdSegMask(rgba, imgWidth, imgHeight),
-  ]);
+  let session: OrtTypes.InferenceSession | null = null;
+  let pageCtdMask: Uint8Array | null = null;
+  if (LOW_RAM_MODE) {
+    await releaseLamaSession();
+    pageCtdMask = await computePageCtdSegMask(rgba, imgWidth, imgHeight);
+    await releaseCtdSession();
+    session = await getRtdetrSession();
+  } else {
+    [session, pageCtdMask] = await Promise.all([
+      getRtdetrSession(),
+      computePageCtdSegMask(rgba, imgWidth, imgHeight),
+    ]);
+  }
   if (!session) {
     return [];
   }

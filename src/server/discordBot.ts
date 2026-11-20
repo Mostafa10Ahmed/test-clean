@@ -10,9 +10,26 @@ import {
   ButtonBuilder,
   ButtonStyle,
   AttachmentBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  PermissionFlagsBits,
 } from 'discord.js';
 import { ChapterCleaningManager } from './chapterProcessor';
 import { BubbleCleanMode } from '../engine/types';
+import { cleanWithRemoteWorker, isRemoteWorkerConfigured } from './remoteWorkerClient';
+import {
+  createAuthUrl,
+  completeManualCodeFromUser,
+  downloadFromDriveLink,
+  getDriveLink,
+  getFallbackTokenJson,
+  parseDriveUrl,
+  resolveDriveAuth,
+  unlinkDrive,
+  updateDriveFolder,
+  uploadToDrive,
+} from './driveOAuth';
 
 export interface DiscordGatewayStatus {
   configured: boolean;
@@ -31,6 +48,7 @@ export class BearDiscordBot {
 
   public readonly slashCommands = [
     '/clean',
+    '/profile',
     '/detect',
     '/review',
     '/status',
@@ -53,6 +71,87 @@ export class BearDiscordBot {
     };
   }
 
+  private buildProfilePayload(userId: string, guildId: string | null, isAdmin: boolean) {
+    const userLink = getDriveLink('user', userId);
+    const guildLink = guildId ? getDriveLink('guild', guildId) : null;
+    const fallback = getFallbackTokenJson();
+
+    const embed = new EmbedBuilder()
+      .setTitle('👤 بروفايلك — ربط Google Drive')
+      .setDescription(
+        'اربط حساب Google Drive بتاعك عشان البوت يستقبل روابط الدرايف (فولدر أو ZIP أو صورة) ويرفعلك الفصول المتبيّضة مباشرة على مساحتك.'
+      )
+      .addFields(
+        {
+          name: '📂 درايفك الشخصي',
+          value: userLink
+            ? `✅ مربوط: **${userLink.email}**\n[فتح فولدر الرفع](${userLink.folderUrl})`
+            : '❌ غير مربوط',
+          inline: false,
+        },
+        {
+          name: '🏠 درايف السيرفر',
+          value: guildLink
+            ? `✅ مربوط: **${guildLink.email}**\n[فتح فولدر السيرفر](${guildLink.folderUrl})`
+            : '❌ غير مربوط',
+          inline: false,
+        },
+        {
+          name: '🤖 الدرايف الاحتياطي (token.json)',
+          value: fallback ? `✅ جاهز كـ fallback (${fallback.email})` : '— غير متوفر',
+          inline: false,
+        }
+      )
+      .setColor(0x0f172a);
+
+    const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId('profile:link_user')
+        .setLabel('🔗 ربط درايفك (Google)')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('profile:paste_code:user')
+        .setLabel('📋 إدخال كود الربط')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('profile:set_folder:user')
+        .setLabel('📁 تحديد فولدر الرفع')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('profile:unlink_user')
+        .setLabel('🗑️ فك الربط')
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(!userLink)
+    );
+
+    const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId('profile:refresh')
+        .setLabel('🔄 تحديث')
+        .setStyle(ButtonStyle.Success)
+    );
+
+    if (guildId && isAdmin) {
+      row2.addComponents(
+        new ButtonBuilder()
+          .setCustomId('profile:link_guild')
+          .setLabel('🏠 ربط درايف السيرفر')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('profile:paste_code:guild')
+          .setLabel('📋 كود السيرفر')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId('profile:unlink_guild')
+          .setLabel('🗑️ فك درايف السيرفر')
+          .setStyle(ButtonStyle.Danger)
+          .setDisabled(!guildLink)
+      );
+    }
+
+    return { embeds: [embed], components: [row1, row2] };
+  }
+
   public async startIfConfigured(): Promise<void> {
     const token = process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_TOKEN;
     if (!token || token.trim() === '') {
@@ -73,14 +172,62 @@ export class BearDiscordBot {
 
       this.client.on('interactionCreate', async (interaction) => {
         try {
+          // --- MODAL SUBMISSIONS (/profile manual code or custom Drive folder) ---
+          if (interaction.isModalSubmit()) {
+            if (interaction.customId.startsWith('modal:drive_code:')) {
+              await interaction.deferReply({ ephemeral: true });
+              const scope = interaction.customId.endsWith(':guild') ? 'guild' : 'user';
+              const ownerId = scope === 'guild' ? interaction.guildId || interaction.user.id : interaction.user.id;
+              const rawInput = interaction.fields.getTextInputValue('code_input');
+              const rec = await completeManualCodeFromUser(scope, ownerId, rawInput);
+              await interaction.editReply({
+                content: `✅ تم ربط Google Drive بنجاح (**${rec.email}**)\n📂 فولدر الرفع: ${rec.folderUrl}`,
+              });
+              return;
+            }
+            if (interaction.customId.startsWith('modal:drive_folder:')) {
+              await interaction.deferReply({ ephemeral: true });
+              const scope = interaction.customId.endsWith(':guild') ? 'guild' : 'user';
+              const ownerId = scope === 'guild' ? interaction.guildId || interaction.user.id : interaction.user.id;
+              const folderInput = interaction.fields.getTextInputValue('folder_input');
+              const updated = updateDriveFolder(scope, ownerId, folderInput);
+              if (!updated) {
+                await interaction.editReply({
+                  content: '❌ اربط حسابك بجوجل الأول من زر **🔗 ربط درايفك** وبعدين حدّد الفولدر.',
+                });
+                return;
+              }
+              await interaction.editReply({
+                content: `✅ تم تحديث فولدر الرفع: ${updated.folderUrl}`,
+              });
+              return;
+            }
+          }
+
+          // --- SLASH COMMANDS ---
           if (interaction.isChatInputCommand()) {
-            await interaction.deferReply();
             const cmdName = `/${interaction.commandName}`;
 
-            // Dedicated /clean handler with explicit clean_sfx boolean + optional file upload
+            // /profile — Interactive Google Drive linking panel
+            if (interaction.commandName === 'profile') {
+              const isAdmin = Boolean(
+                interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
+                  interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+              );
+              const payload = this.buildProfilePayload(interaction.user.id, interaction.guildId, isAdmin);
+              await interaction.reply({ ...payload, ephemeral: true });
+              return;
+            }
+
+            await interaction.deferReply();
+
+            // Dedicated /clean handler with explicit clean_sfx + file upload OR Google Drive link + Drive upload
             if (interaction.commandName === 'clean') {
               const cleanSfx = interaction.options.getBoolean('clean_sfx', true);
               const attachment = interaction.options.getAttachment('file');
+              const driveLinkOpt = interaction.options.getString('drive_link')?.trim() || '';
+              const uploadToDriveOpt = interaction.options.getBoolean('upload_to_drive');
+              const outputFolderOpt = interaction.options.getString('output_drive_folder')?.trim() || '';
               const chapterOpt = interaction.options.getString('chapter') || '';
               const bubbleModeOpt = interaction.options.getString('bubble_mode');
               const bubbleCleanMode: BubbleCleanMode | undefined =
@@ -90,69 +237,176 @@ export class BearDiscordBot {
                     ? 'WHITEN'
                     : undefined;
 
-              if (attachment) {
-                const response = await fetch(attachment.url);
-                if (!response.ok) {
-                  throw new Error(`Failed to download attached file (${response.status})`);
-                }
-                const arrayBuf = await response.arrayBuffer();
-                const fileName = attachment.name || 'page.png';
-                const job = await this.manager.ingestUploadedFiles(
-                  [{ originalname: fileName, buffer: Buffer.from(arrayBuf) }],
-                  `Discord: ${fileName}`,
-                  { enableSFX: cleanSfx, bubbleCleanMode }
-                );
+              if (attachment || driveLinkOpt) {
+                let inputBuffer: Buffer;
+                let fileName: string;
+                let driveAuth: Awaited<ReturnType<typeof resolveDriveAuth>> = null;
+                let sourceFolderId: string | undefined;
 
-                const filesToSend: AttachmentBuilder[] = [];
-                if (job.pages.length === 1 && job.pages[0].cleanedUrl) {
-                  const pngPath = this.manager.resolveDiskPathFromUrl(job.pages[0].cleanedUrl);
-                  if (fs.existsSync(pngPath) && fs.statSync(pngPath).size <= DISCORD_MAX_ATTACHMENT_BYTES) {
-                    filesToSend.push(
-                      new AttachmentBuilder(pngPath, {
-                        name: `${job.pages[0].fileName.replace(/\.[^.]+$/, '')}_cleaned.png`,
-                      })
-                    );
+                if (driveLinkOpt) {
+                  driveAuth = await resolveDriveAuth(interaction.user.id, interaction.guildId);
+                  if (!driveAuth) {
+                    await interaction.editReply({
+                      content: '📂 مفيش حساب Google Drive مربوط. اربط حسابك الأول من `/profile` وبعدين جرّب تاني.',
+                    });
+                    return;
                   }
-                } else if (job.zipDownloadUrl) {
-                  const zipPath = this.manager.resolveDiskPathFromUrl(job.zipDownloadUrl);
-                  if (fs.existsSync(zipPath) && fs.statSync(zipPath).size <= DISCORD_MAX_ATTACHMENT_BYTES) {
-                    filesToSend.push(
-                      new AttachmentBuilder(zipPath, { name: `${job.id}_cleaned.zip` })
-                    );
+                  const downloaded = await downloadFromDriveLink(driveLinkOpt, driveAuth.accessToken);
+                  inputBuffer = downloaded.buffer;
+                  fileName = downloaded.fileName;
+                  sourceFolderId = downloaded.sourceFolderId;
+                } else {
+                  const response = await fetch(attachment!.url);
+                  if (!response.ok) {
+                    throw new Error(`Failed to download attached file (${response.status})`);
                   }
+                  inputBuffer = Buffer.from(await response.arrayBuffer());
+                  fileName = attachment!.name || 'page.png';
                 }
 
-                const embed = new EmbedBuilder()
-                  .setTitle(`Cleaned: ${fileName}`)
-                  .setDescription(
-                    `Processed **${job.totalPages}** page(s) · **${job.cleanedRegions}** regions cleaned in **${(job.totalProcessingTimeMs / 1000).toFixed(2)}s**.`
-                  )
-                  .addFields(
-                    {
-                      name: 'SFX Cleaning',
-                      value: cleanSfx ? 'Enabled (SFX Cleaned)' : 'Disabled (SFX Untouched)',
-                      inline: true,
-                    },
-                    {
-                      name: 'Bubble Mode',
-                      value:
-                        job.settings.bubbleCleanMode === 'TEXT_ONLY'
-                          ? 'Text-Only Removal'
-                          : 'Smart Whitening (#FFFFFF)',
-                      inline: true,
-                    },
-                    {
-                      name: 'Job ID',
-                      value: job.id,
-                      inline: true,
+                let outputPath = '';
+                let outputFileName = '';
+                let totalPages = 1;
+                let cleanedRegions = 0;
+                let totalProcessingTimeMs = 0;
+                let finalBubbleMode: BubbleCleanMode = bubbleCleanMode || 'WHITEN';
+                let jobId = '';
+                let cleanupOutputPath = false;
+
+                if (isRemoteWorkerConfigured()) {
+                  const remote = await cleanWithRemoteWorker({
+                    fileName,
+                    buffer: inputBuffer,
+                    cleanSfx,
+                    bubbleCleanMode,
+                  });
+                  outputPath = remote.outputPath;
+                  outputFileName = remote.outputFileName;
+                  totalPages = remote.totalPages;
+                  cleanedRegions = remote.cleanedRegions;
+                  totalProcessingTimeMs = remote.totalProcessingTimeMs;
+                  finalBubbleMode = remote.bubbleCleanMode;
+                  jobId = remote.jobId;
+                  cleanupOutputPath = true;
+                } else {
+                  const job = await this.manager.ingestUploadedFiles(
+                    [{ originalname: fileName, buffer: inputBuffer }],
+                    `Discord: ${fileName}`,
+                    { enableSFX: cleanSfx, bubbleCleanMode }
+                  );
+                  totalPages = job.totalPages;
+                  cleanedRegions = job.cleanedRegions;
+                  totalProcessingTimeMs = job.totalProcessingTimeMs;
+                  finalBubbleMode = job.settings.bubbleCleanMode;
+                  jobId = job.id;
+                  if (job.pages.length === 1 && job.pages[0].cleanedUrl) {
+                    outputPath = this.manager.resolveDiskPathFromUrl(job.pages[0].cleanedUrl);
+                    outputFileName = `${job.pages[0].fileName.replace(/\.[^.]+$/, '')}_cleaned.png`;
+                  } else if (job.zipDownloadUrl) {
+                    outputPath = this.manager.resolveDiskPathFromUrl(job.zipDownloadUrl);
+                    outputFileName = `${job.id}_cleaned.zip`;
+                  }
+                }
+
+                try {
+                  const fileSize = outputPath && fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
+                  const shouldUploadToDrive =
+                    uploadToDriveOpt === true ||
+                    (uploadToDriveOpt !== false && (Boolean(driveLinkOpt) || fileSize > DISCORD_MAX_ATTACHMENT_BYTES));
+
+                  let uploadedDriveLink = '';
+                  let driveSourceLabel = '';
+
+                  if (shouldUploadToDrive && outputPath && fs.existsSync(outputPath)) {
+                    if (!driveAuth) {
+                      driveAuth = await resolveDriveAuth(interaction.user.id, interaction.guildId);
                     }
-                  )
-                  .setColor(0x0f172a);
+                    if (driveAuth) {
+                      let targetFolderId = driveAuth.folderId;
+                      if (outputFolderOpt) {
+                        const parsedTarget = parseDriveUrl(outputFolderOpt);
+                        if (parsedTarget?.id) targetFolderId = parsedTarget.id;
+                      } else if (sourceFolderId && driveLinkOpt) {
+                        targetFolderId = driveAuth.folderId;
+                      }
+                      const outBuf = await fs.promises.readFile(outputPath);
+                      const mimeType = outputFileName.toLowerCase().endsWith('.png')
+                        ? 'image/png'
+                        : 'application/zip';
+                      const up = await uploadToDrive({
+                        accessToken: driveAuth.accessToken,
+                        parentFolderId: targetFolderId,
+                        fileName: outputFileName,
+                        buffer: outBuf,
+                        mimeType,
+                      });
+                      uploadedDriveLink = up.webViewLink;
+                      driveSourceLabel = driveAuth.sourceLabel;
+                    }
+                  }
 
-                await interaction.editReply({
-                  embeds: [embed],
-                  files: filesToSend,
-                });
+                  const filesToSend: AttachmentBuilder[] = [];
+                  if (
+                    outputPath &&
+                    fs.existsSync(outputPath) &&
+                    fileSize <= DISCORD_MAX_ATTACHMENT_BYTES &&
+                    !uploadedDriveLink
+                  ) {
+                    filesToSend.push(new AttachmentBuilder(outputPath, { name: outputFileName }));
+                  }
+
+                  const embed = new EmbedBuilder()
+                    .setTitle(`Cleaned: ${fileName}`)
+                    .setDescription(
+                      `Processed **${totalPages}** page(s) · **${cleanedRegions}** regions cleaned in **${(totalProcessingTimeMs / 1000).toFixed(2)}s**${isRemoteWorkerConfigured() ? ' (Remote Worker)' : ''}.` +
+                        (uploadedDriveLink
+                          ? `\n\n📂 **[فتح النتيجة على Google Drive](${uploadedDriveLink})** (${driveSourceLabel})`
+                          : '')
+                    )
+                    .addFields(
+                      {
+                        name: 'SFX Cleaning',
+                        value: cleanSfx ? 'Enabled (SFX Cleaned)' : 'Disabled (SFX Untouched)',
+                        inline: true,
+                      },
+                      {
+                        name: 'Bubble Mode',
+                        value:
+                          finalBubbleMode === 'TEXT_ONLY'
+                            ? 'Text-Only Removal'
+                            : 'Smart Whitening (#FFFFFF)',
+                        inline: true,
+                      },
+                      {
+                        name: 'Job ID',
+                        value: jobId,
+                        inline: true,
+                      }
+                    )
+                    .setColor(0x0f172a);
+
+                  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+                  if (uploadedDriveLink) {
+                    components.push(
+                      new ActionRowBuilder<ButtonBuilder>().addComponents(
+                        new ButtonBuilder()
+                          .setLabel('📂 فتح الملف على Google Drive')
+                          .setStyle(ButtonStyle.Link)
+                          .setURL(uploadedDriveLink)
+                      )
+                    );
+                  }
+
+                  await interaction.editReply({
+                    embeds: [embed],
+                    components,
+                    files: filesToSend,
+                  });
+                } finally {
+                  if (cleanupOutputPath && outputPath) {
+                    fs.promises.unlink(outputPath).catch(() => {});
+                  }
+                }
                 return;
               }
 
@@ -189,6 +443,86 @@ export class BearDiscordBot {
             await this.sendBotReplyEmbed(interaction, botReply, []);
           } else if (interaction.isButton()) {
             const customId = interaction.customId;
+
+            // --- /profile interactive buttons ---
+            if (customId === 'profile:refresh') {
+              const isAdmin = Boolean(
+                interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
+                  interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+              );
+              const payload = this.buildProfilePayload(interaction.user.id, interaction.guildId, isAdmin);
+              await interaction.update(payload);
+              return;
+            }
+
+            if (customId === 'profile:link_user' || customId === 'profile:link_guild') {
+              const scope = customId === 'profile:link_guild' ? 'guild' : 'user';
+              const ownerId = scope === 'guild' ? interaction.guildId || interaction.user.id : interaction.user.id;
+              const auth = createAuthUrl(scope, ownerId);
+              if ('error' in auth) {
+                await interaction.reply({ content: `❌ ${auth.error}`, ephemeral: true });
+                return;
+              }
+              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setLabel('🔗 تسجيل الدخول بحساب Google')
+                  .setStyle(ButtonStyle.Link)
+                  .setURL(auth.url)
+              );
+              const hint = auth.isLocalhostManual
+                ? 'بعد ما توافق على الصلاحيات، المتصفح هيحولك على `http://localhost/?code=...` — انسخ الرابط من شريط العنوان ودوس زر **📋 إدخال كود الربط** في `/profile`.'
+                : 'بعد ما توافق على الصلاحيات هيتم الربط تلقائياً، ارجع ودوس **🔄 تحديث** في `/profile`.';
+              await interaction.reply({
+                content: `🔐 **رابط ربط Google Drive (${scope === 'guild' ? 'للسيرفر' : 'لحسابك'})** (صالح 10 دقايق):\n${hint}`,
+                components: [row],
+                ephemeral: true,
+              });
+              return;
+            }
+
+            if (customId === 'profile:unlink_user' || customId === 'profile:unlink_guild') {
+              const scope = customId === 'profile:unlink_guild' ? 'guild' : 'user';
+              const ownerId = scope === 'guild' ? interaction.guildId || interaction.user.id : interaction.user.id;
+              unlinkDrive(scope, ownerId);
+              const isAdmin = Boolean(
+                interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
+                  interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+              );
+              const payload = this.buildProfilePayload(interaction.user.id, interaction.guildId, isAdmin);
+              await interaction.update(payload);
+              return;
+            }
+
+            if (customId.startsWith('profile:paste_code:')) {
+              const scope = customId.endsWith(':guild') ? 'guild' : 'user';
+              const modal = new ModalBuilder()
+                .setCustomId(`modal:drive_code:${scope}`)
+                .setTitle('📋 إكمال ربط Google Drive');
+              const input = new TextInputBuilder()
+                .setCustomId('code_input')
+                .setLabel('الصق رابط http://localhost/?code=... أو الكود')
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true);
+              modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+              await interaction.showModal(modal);
+              return;
+            }
+
+            if (customId.startsWith('profile:set_folder:')) {
+              const scope = customId.endsWith(':guild') ? 'guild' : 'user';
+              const modal = new ModalBuilder()
+                .setCustomId(`modal:drive_folder:${scope}`)
+                .setTitle('📁 تحديد فولدر رفع Google Drive');
+              const input = new TextInputBuilder()
+                .setCustomId('folder_input')
+                .setLabel('رابط فولدر Google Drive (أو الـ Folder ID)')
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true);
+              modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+              await interaction.showModal(modal);
+              return;
+            }
+
             if (customId.startsWith('cmd:')) {
               await interaction.deferReply();
               const cmd = customId.replace(/^cmd:/, '');
@@ -240,9 +574,7 @@ export class BearDiscordBot {
           new ButtonBuilder()
             .setCustomId(`cmd:${act.command}`)
             .setLabel(act.label)
-            .setStyle(
-              act.variant === 'primary' ? ButtonStyle.Primary : ButtonStyle.Secondary
-            )
+            .setStyle(act.variant === 'primary' ? ButtonStyle.Primary : ButtonStyle.Secondary)
         );
       }
       components.push(row);
@@ -258,8 +590,11 @@ export class BearDiscordBot {
   private async registerSlashCommands(token: string, clientId: string): Promise<void> {
     const commands = [
       new SlashCommandBuilder()
+        .setName('profile')
+        .setDescription('ربط حساب Google Drive الخاص بك أو بالسيرفر للاستقبال والرفع المباشر'),
+      new SlashCommandBuilder()
         .setName('clean')
-        .setDescription('Clean an image, chapter ZIP, or mounted chapter with explicit SFX choice')
+        .setDescription('Clean an image, chapter ZIP, or Google Drive link with explicit SFX choice')
         .addBooleanOption((opt) =>
           opt
             .setName('clean_sfx')
@@ -269,7 +604,25 @@ export class BearDiscordBot {
         .addAttachmentOption((opt) =>
           opt
             .setName('file')
-            .setDescription('Optional PNG/JPG/WebP page or full-chapter ZIP archive to clean directly')
+            .setDescription('Optional PNG/JPG/WebP page or full-chapter ZIP archive')
+            .setRequired(false)
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName('drive_link')
+            .setDescription('Google Drive link (folder of images, ZIP archive, or single image)')
+            .setRequired(false)
+        )
+        .addBooleanOption((opt) =>
+          opt
+            .setName('upload_to_drive')
+            .setDescription('Upload cleaned result to your linked Google Drive (auto when using drive_link)')
+            .setRequired(false)
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName('output_drive_folder')
+            .setDescription('Optional target Google Drive folder link for uploading the cleaned result')
             .setRequired(false)
         )
         .addStringOption((opt) =>
@@ -322,5 +675,10 @@ export class BearDiscordBot {
 
     const rest = new REST({ version: '10' }).setToken(token);
     await rest.put(Routes.applicationCommands(clientId), { body: commands });
+
+    const guildId = (process.env.DISCORD_GUILD_ID || '').trim();
+    if (guildId) {
+      await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands }).catch(() => {});
+    }
   }
 }
