@@ -1,0 +1,8 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+
+This project is distributed under the GNU General Public License v3.0 or later.
+Full license text: https://www.gnu.org/licenses/gpl-3.0.en.html
+
+Upstream reference attribution:
+- Bear (https://github.com/k-omiq/Bear) — GPL-3.0
+- Individual ONNX model weights downloaded at runtime remain subject to their respective upstream licenses.

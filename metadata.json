@@ -1,0 +1,6 @@
+{
+  "name": "BearBot — AI Manhwa & Manga Cleaning Bot",
+  "description": "Professional AI-powered Manhwa & Manga scanlation cleaning bot with native-resolution speech bubble whitening, OT/ST removal, SFX reconstruction, and automated full-chapter ZIP processing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

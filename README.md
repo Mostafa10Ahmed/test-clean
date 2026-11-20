@@ -1,118 +1,74 @@
-# بوت التبييض (Discord → gofile)
+# BearBot — AI Manhwa & Manga Cleaning Bot
 
-بوت ديسكورد بياخد فصل (zip فيه صور، أو لينك)، **يبيّضه بنفسه**، ويرفع النتيجة على gofile ويرجعلك الرابط.
-مش محتاج أي سيرفر تاني: موديل كشف الكلام (CTD) بيتحمّل أوتوماتيك أول تشغيل، وبيشتغل على CPU عادي.
+Full-stack AI-powered Manhwa & Manga scanlation cleaning bot (Discord Bot + Web Review Studio + Native-Resolution ONNX Cleaning Pipeline) inspired by `k-omiq/Bear`.
 
-## إزاي بيبيّض
+## Key Features
 
-1. موديل **CTD** (comic-text-detector) بيحدد مكان الكلام في الصفحة. الصفحات الطويلة (ويبتون) بتتقسم عشان الكلام ما يصغرش.
-2. لكل جملة بيبص على اللي حواليها:
-   - **فقاعة سادة** (بيضا أو لون واحد): بيملاها بنفس اللون، فالتبييض بيطلع نضيف 100% والإطار بيفضل زي ما هو.
-   - **كلام فوق رسمة**: بيعمل inpaint. بروفايل `perfect` بيستخدم LaMa لو `simple-lama-inpainting` متسطّبة، وإلا بيستخدم OpenCV.
+- **Explicit SFX Control on `/clean`**:
+  - Every `/clean` run lets the user explicitly choose whether to clean Sound Effects (`clean_sfx: true` or `clean_sfx: false`).
+  - Discord Slash Command: `/clean clean_sfx:<True|False> [file:<image or .zip>] [chapter:<chapterId>] [bubble_mode:<whiten|text_only>]`
+  - Web Console & CLI syntax: `/clean chapter1 sfx:false` or `/clean chapter1 sfx:true mode:text_only`
+- **Direct Discord Image & Chapter ZIP Uploads**:
+  - Attach a single `.png/.jpg/.webp` page or a full chapter `.zip` directly inside `/clean`, select `clean_sfx`, and receive the cleaned lossless PNG or ZIP right in Discord.
+- **4 Independent Cleaning Categories**:
+  1. **Speech Bubbles** (Smart Bubble Whitening `#FFFFFF` or Text-Only Removal; colored/textured bubble protection).
+  2. **OT (Outside Text)** including tilted banners, red/white ribbons, double-outlined subtitles, and system windows.
+  3. **ST (Side Text)** & margin annotations.
+  4. **SFX (Stylized Sound Effects)** with manual review flagging.
+- **Native-Resolution ONNX Pipeline**:
+  - `detector-v4-s_int8.onnx` (RT-DETR Comic Text & Bubble Detector)
+  - `comictextdetector.pt.onnx` (CTD pixel-level text segmentation)
+  - `lama-manga.onnx` (Manga-LaMa inpainting with native-resolution overlapping sub-crops for wide subtitles)
+  - 100% bit-identical pixel preservation outside authorized region masks.
 
-## المكونات
-
-| ملف | الوظيفة |
-|---|---|
-| `bot.py` | أوامر ديسكورد: `/clean` و `/queue` و `/cancel` |
-| `local_cleaner.py` | **محرك التبييض المدمج** (الافتراضي) |
-| `queue_manager.py` | الطابور (FIFO، إلغاء، حد أقصى للانتظار، حالة كل جوب) |
-| `sources.py` | تحميل الـ zip من لينك (Google Drive، gofile، رابط مباشر) |
-| `cli_cleaner.py` | محرك اختياري: manga-translator-ui متسطّب على نفس الجهاز |
-| `remote_cleaner.py` | محرك اختياري: سيرفر GPU عن بعد (Colab) |
-| `worker_server.py` | سيرفر الـ GPU نفسه (بيشتغل على Colab) |
-| `whitening.py` | فك الـ zip، ترتيب الصفحات طبيعياً، تجميع الخرج |
-| `profiles.py` | بروفايلات `perfect` و `fast` |
-| `gofile.py` | رفع الـ zip على gofile |
-
-## التشغيل
-
-### 1) إعداد البوت
+## Quick Start (Local / VPS)
 
 ```bash
-pip install -r requirements.txt
-copy .env.example .env
+# 1. Install dependencies
+npm install
+
+# 2. Configure environment variables
+cp .env.example .env
+# Edit .env and set DISCORD_BOT_TOKEN (and optionally GEMINI_API_KEY)
+
+# 3. Pre-download ONNX models (~300 MB total; also auto-downloads on first clean)
+npm run download-models
+
+# 4. Run the bot & web studio on port 3000
+npm run dev
 ```
 
-عبّي `DISCORD_TOKEN` في `.env` (وممكن `GOFILE_TOKEN`). كده البوت جاهز يبيّض.
-
-اختياري، لجودة أعلى للكلام اللي فوق الرسومات (محتاج torch، تقيلة):
+For production builds:
 
 ```bash
-pip install simple-lama-inpainting
+npm run build
+NODE_ENV=production npm start
 ```
 
-### 2) شغّل البوت
+## Docker Deployment
 
 ```bash
-python bot.py
+docker build -t bearbot-cleaner .
+docker run -p 3000:3000 --env-file .env -v $(pwd)/models:/app/models bearbot-cleaner
 ```
 
-## فولدر Google Drive
+## Discord Bot Setup
 
-`/clean link:<لينك فولدر>` بيحمّل الصور اللي جوه الفولدر (وفولدراته الفرعية لحد مستويين) ويبيّضها. لازم:
+1. Create an application in the Discord Developer Portal and copy the Bot Token into `DISCORD_BOT_TOKEN` in `.env`.
+2. Invite the bot with `bot` and `applications.commands` scopes (Send Messages, Attach Files).
+3. Start the server — slash commands (`/clean`, `/detect`, `/review`, `/status`, `/cancel`, `/settings`, `/export`, `/help`) register automatically when the bot connects.
 
-1. تعمل **API Key**: Google Cloud Console ← مشروع جديد ← فعّل **Google Drive API** ← Credentials ← Create API key.
-2. تحط `GOOGLE_API_KEY` في Railway Variables.
-3. الفولدر يكون **Anyone with the link** (Viewer).
-
-لو الفولدر فيه ملف zip واحد بس من غير صور، بيحمّله ويبيّضه.
-
-## خدمة worker منفصلة (اختياري)
-
-البوت بيفضل خفيف، والتبييض بيتعمل في خدمة تانية. فايدتها إن الـ worker لو وقع من الرامات البوت مبيقعش ولا الطابور بيضيع. ولازم الـ worker يكون على سيرفر **رامات أكتر**، وإلا مفيش فرق.
-
-1. في نفس الريبو اعمل خدمة تانية على Railway (**New ← GitHub Repo** لنفس الريبو).
-2. Variables للـ worker **بس** (من غير `DISCORD_TOKEN`):
-   - `WORKER_MODE=1` ← بيخلي الخدمة تشغّل سيرفر التبييض بدل البوت
-   - `WORKER_TOKEN` = قيمة طويلة عشوائية
-   - `WORKER_ENGINE=builtin`
-   - `MODEL_DIR=/data/models` + Volume على `/data`
-   - `MALLOC_ARENA_MAX=2`
-3. Settings ← Networking ← **Generate Domain**.
-4. في خدمة البوت: `CLEAN_ENGINE=remote` و`WORKER_URL=https://<دومين الـ worker>` و`WORKER_TOKEN` بنفس القيمة.
-5. اختبر: افتح `https://<الدومين>/health`، لازم يرجع `{"ok":true,"engine":"builtin"}`.
-
-## الأوامر
-
-- `/clean chapter:<ملف zip>` أو `/clean link:<لينك>` + `profile:<perfect|fast>` — بيضيف الفصل للطابور ويرجعلك رابط gofile لما يخلص.
-- `/queue` — الجاري والمنتظر.
-- `/cancel job_id:<رقم>` — يلغي فصل لسه في الانتظار (صاحبه أو أدمن بس).
-
-## البروفايلات
-
-| | الكلام في الفقاعات | الكلام فوق الرسومات |
-|---|---|---|
-| `perfect` | ملء بلون الخلفية | LaMa (لو متسطّبة) وإلا OpenCV |
-| `fast` | ملء بلون الخلفية | OpenCV (أسرع) |
-
-## محركات تانية (اختياري)
-
-`CLEAN_ENGINE` في `.env`:
-- `builtin` (الافتراضي): البوت بيبيّض بنفسه.
-- `remote`: يبعت لسيرفر GPU على Colab. شوف [SETUP.md](SETUP.md).
-- `cli`: يشغّل [manga-translator-ui](https://github.com/hgmzhn/manga-translator-ui) متسطّب على نفس الجهاز.
-
-## الإعدادات (`.env`)
-
-شوف `.env.example` للقائمة كاملة. أهمها:
-
-- `PAGE_CONCURRENCY` — عدد الصفحات اللي بتتبيّض مع بعض (المحرك المدمج). الافتراضي 1 (أقل رامات).
-- `CV_THREADS` — عدد threads الحساب (فاضي = أنوية الحاوية).
-- `TILE_RATIO` — الصفحات الطويلة: `1.5` أسرع، `1` أدق.
-- `QUEUE_WORKERS` — عدد الفصول اللي بتتعالج مع بعض. خليه 1 مع GPU واحد.
-- `MAX_PENDING` — أقصى عدد فصول في الانتظار.
-- `ALLOWED_CHANNEL_IDS` — الرومات المسموح فيها بالأوامر.
-- `ADMIN_ROLE_ID` — رتبة تقدر تلغي أي جوب.
-
-## قيود معروفة
-
-- الطابور في الذاكرة: لو البوت اتقفل، الفصول اللي في الانتظار بتضيع.
-- الملف المرفوع على ديسكورد لازم يكون ≤ 25MB؛ للأكبر استخدم لينك.
-
-## الاختبارات (سيرفر الـ worker)
+## Pushing Updates to `Mostafa10Ahmed/test-clean`
 
 ```bash
-pip install fastapi httpx python-multipart
-python -m pytest -q test_worker.py
+git clone https://github.com/Mostafa10Ahmed/test-clean.git
+cd test-clean
+unzip -o ../test-clean-bot.zip -d .
+git add -A
+git commit -m "Update BearBot engine, add explicit clean_sfx option in /clean"
+git push origin main
 ```
+
+## License & Attribution
+
+Licensed under `GPL-3.0-or-later` (see `LICENSE`), respecting the upstream `k-omiq/Bear` project and individual ONNX model licenses.
