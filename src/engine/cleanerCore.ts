@@ -2037,7 +2037,30 @@ export function tryCleanFlatOrGradientRing(params: {
 
   if (ringPixels.length < 20) return null;
 
+  // Measure local neighbor texture/detail energy in the unmasked ring to catch translucent bubbles over artwork!
+  let localGradSum = 0;
+  let localGradCnt = 0;
+  const gradStep = Math.max(1, Math.floor(ringPixels.length / 240));
+  for (let i = 0; i < ringPixels.length; i += gradStep) {
+    const rp = ringPixels[i];
+    const gx = bx + rp.x;
+    const gy = by + rp.y;
+    if (gx + 2 < imgWidth && gy + 2 < imgHeight) {
+      const pR = (gy * imgWidth + (gx + 2)) * 4;
+      const pD = ((gy + 2) * imgWidth + gx) * 4;
+      const lR = rgbToLuma(rgba[pR], rgba[pR + 1], rgba[pR + 2]);
+      const lD = rgbToLuma(rgba[pD], rgba[pD + 1], rgba[pD + 2]);
+      localGradSum += Math.abs(rp.l - lR) + Math.abs(rp.l - lD);
+      localGradCnt += 2;
+    }
+  }
+  const localTexMean = localGradCnt > 0 ? localGradSum / localGradCnt : 0;
+
   const sortedL = [...ringPixels].sort((a, b) => a.l - b.l);
+  const fullP05 = sortedL[Math.floor(sortedL.length * 0.05)].l;
+  const fullP95 = sortedL[Math.min(sortedL.length - 1, Math.floor(sortedL.length * 0.95))].l;
+  const fullLumaSpread = fullP95 - fullP05;
+
   // Trim top/bottom 10% luma outliers so stray unmasked specks never bias the ring statistics
   const trimStart = Math.floor(sortedL.length * 0.1);
   const trimEnd = Math.max(trimStart + 8, Math.ceil(sortedL.length * 0.9));
@@ -2056,15 +2079,27 @@ export function tryCleanFlatOrGradientRing(params: {
   const spreadB = bs[p90Idx] - bs[p10Idx];
   const maxSpread = Math.max(spreadR, spreadG, spreadB);
 
+  // Measure hue/chroma variation inside the ring (translucent bubbles over colored art have varying R-B / R-G!)
+  const rgDiffs = trimmed.map((p) => p.r - p.g).sort((a, b) => a - b);
+  const rbDiffs = trimmed.map((p) => p.r - p.b).sort((a, b) => a - b);
+  const chromaSpread = Math.max(
+    rgDiffs[p90Idx] - rgDiffs[p10Idx],
+    rbDiffs[p90Idx] - rbDiffs[p10Idx]
+  );
+
+  // If the bubble/box shows translucent artwork texture or multi-color bleed, NEVER flat-fill or plane-fit — route to LaMa!
+  if (localTexMean > 3.8 || chromaSpread > 12) {
+    return null;
+  }
+
   let medR = rs[medIdx];
   let medG = gs[medIdx];
   let medB = bs[medIdx];
   const medL = trimmed[medIdx].l;
 
-  // Tier 1: Flat Solid Background (White, Black, Lavender, Grey, Cream, Gold Plaque)
-  // For regions tagged SFX, require an extra-tight solid ring (maxSpread <= 12) so textured SFX still route to LaMa.
-  const flatSpreadLimit = region.category === 'SFX' ? 12 : 16;
-  if (maxSpread <= flatSpreadLimit) {
+  // Tier 1: Flat Solid Background (strict enough so translucent bubbles over artwork route to LaMa)
+  const flatSpreadLimit = region.category === 'SFX' ? 10 : 11;
+  if (maxSpread <= flatSpreadLimit && fullLumaSpread <= 22 && localTexMean <= 2.6) {
     if (medL >= 250 && maxSpread <= 6) {
       medR = 255;
       medG = 255;
@@ -2163,8 +2198,8 @@ export function tryCleanFlatOrGradientRing(params: {
   const mae = sumErr / samples.length;
   const p90Err = errs[Math.floor(errs.length * 0.9)];
 
-  const maxAllowedMae = medL >= 120 ? 4.2 : 2.0;
-  const maxAllowedP90 = medL >= 120 ? 8.5 : 4.2;
+  const maxAllowedMae = medL >= 120 ? 2.8 : 1.8;
+  const maxAllowedP90 = medL >= 120 ? 5.8 : 3.8;
   if (mae > maxAllowedMae || p90Err > maxAllowedP90) {
     return null;
   }

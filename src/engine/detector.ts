@@ -113,6 +113,25 @@ export function measureSurroundRing(
   const sparkleOuterRatio = brightOuterSparklePixels / Math.max(1, totalRingPixels);
   const isLikelyDarkBg = (darkOuterRatio >= 0.48 && sparkleOuterRatio <= 0.18) || medianLuma < 36;
 
+  // Detect translucent / semi-transparent bubbles over artwork using ALL innerRimSamples (unfiltered!)
+  let innerHasArtworkShowthrough = false;
+  if (innerRimSamples.length >= 16) {
+    const innerSortedL = innerRimSamples.map((s) => s.l).sort((a, b) => a - b);
+    const innerP10 = innerSortedL[Math.floor(innerSortedL.length * 0.10)];
+    const innerP90 = innerSortedL[Math.floor(innerSortedL.length * 0.90)];
+    const innerSpread = innerP90 - innerP10;
+    const midDarkCount = innerRimSamples.filter((s) => s.l >= 35 && s.l < 228).length;
+    const midDarkRatio = midDarkCount / innerRimSamples.length;
+    const coloredCount = innerRimSamples.filter(
+      (s) => Math.max(Math.abs(s.r - s.g), Math.abs(s.g - s.b), Math.abs(s.r - s.b)) >= 14
+    ).length;
+    const coloredRatio = coloredCount / innerRimSamples.length;
+    // Translucent bubble over artwork shows mid-tone/colored background bleed or >18 luma variation inside the rim
+    if (innerSpread > 18 || midDarkRatio > 0.22 || coloredRatio > 0.16) {
+      innerHasArtworkShowthrough = true;
+    }
+  }
+
   // Prefer innerRimSamples for light bubbles when enough non-stroke samples exist so we measure
   // the actual paper inside the box (preventing outer gutter from masking a gray gradient box!)
   const lightInnerRim = innerRimSamples.filter((s) => s.l >= 165);
@@ -196,10 +215,11 @@ export function measureSurroundRing(
   // Strict pure-white check: off-white (236..249), tinted/translucent (maxChroma > 6), or subtle
   // gradients (hasDirectionalGradient) must NOT be painted with a flat #FFFFFF rectangle!
   const isWhiteBubble =
+    !innerHasArtworkShowthrough &&
     rawMeanLuma >= 250.5 &&
     p20BgLuma >= 246 &&
-    stdLuma <= 4.5 &&
-    maxChroma <= 6.5 &&
+    stdLuma <= 4.0 &&
+    maxChroma <= 6.0 &&
     !hasDirectionalGradient;
 
   // Strict pure-black speech bubble check: requires >= 76% of outer ring to be pure black (<=6)
@@ -212,7 +232,7 @@ export function measureSurroundRing(
     !hasDirectionalGradient;
 
   const isUniform =
-    (stdLuma <= 4.0 && !hasDirectionalGradient && maxChroma <= 8.0) ||
+    (!innerHasArtworkShowthrough && stdLuma <= 3.5 && !hasDirectionalGradient && maxChroma <= 7.0) ||
     isWhiteBubble ||
     isDarkBubble;
   const isPeriodicScreentone = !isUniform && transitionRate > 0.22 && stdLuma < 48;
