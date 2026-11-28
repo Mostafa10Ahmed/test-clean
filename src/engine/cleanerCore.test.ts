@@ -621,3 +621,92 @@ test('Regression: Solid gold plaque classified as SFX cleans cleanly via FLAT_RI
   assert.equal(rgba[centerIdx + 2], 132);
 });
 
+test('Regression: Heavy white-stroked OT over colored/gradient background masks BOTH dark core AND thick white stroke halo without turning text into white blobs', async () => {
+  const { buildRegionPixelMask, tryCleanFlatOrGradientRing } = await import('./cleanerCore');
+  const w = 160;
+  const h = 100;
+  const rgba = new Uint8Array(w * h * 4);
+  // Smooth blue gradient background (155..215)
+  for (let y = 0; y < h; y++) {
+    const t = y / (h - 1);
+    const r = Math.round(145 + 55 * t);
+    const g = Math.round(175 + 45 * t);
+    const b = Math.round(225 + 20 * t);
+    for (let x = 0; x < w; x++) {
+      const p = (y * w + x) * 4;
+      rgba[p] = r;
+      rgba[p + 1] = g;
+      rgba[p + 2] = b;
+      rgba[p + 3] = 255;
+    }
+  }
+
+  // Draw 4 complete black letters with a thick 6px pure-white outer stroke ("ستروك قوي")
+  for (let y = 26; y < 74; y++) {
+    for (let x = 30; x < 126; x++) {
+      const inGlyph = (x - 30) % 24 >= 6 && (x - 30) % 24 <= 14 && y >= 34 && y <= 66;
+      const inWhiteStroke = (x - 30) % 24 >= 1 && (x - 30) % 24 <= 19 && y >= 28 && y <= 72;
+      const p = (y * w + x) * 4;
+      if (inGlyph) {
+        rgba[p] = 18;
+        rgba[p + 1] = 18;
+        rgba[p + 2] = 22;
+      } else if (inWhiteStroke) {
+        rgba[p] = 255;
+        rgba[p + 1] = 255;
+        rgba[p + 2] = 255;
+      }
+    }
+  }
+
+  const surround = measureSurroundRing(rgba, w, h, { x: 8, y: 8, w: w - 16, h: h - 16 });
+  const region: DetectedRegion = {
+    id: 'heavy_stroke_ot_test',
+    pageIndex: 0,
+    category: 'OT',
+    bbox: { x: 8, y: 8, w: w - 16, h: h - 16 },
+    insideBubble: false,
+    confidence: 0.72,
+    sourceScript: 'KO',
+    routedEngine: 'LAMA_PATCH',
+    bubbleCleanMode: 'TEXT_ONLY',
+    paddingPx: 3,
+    featherPx: 2,
+    fillColorHex: '#AABBCC',
+    inkCoverageRatio: 0.25,
+    surroundStats: surround,
+    status: 'DETECTED',
+    reviewStatus: 'AUTO_APPROVED',
+    manualEdits: [],
+  };
+
+  const { writeMask, interiorCandidate } = buildRegionPixelMask({
+    rgba,
+    imgWidth: w,
+    imgHeight: h,
+    region,
+    preserveColoredBubbles: true,
+  });
+
+  // Verify BOTH the inner black glyph (x=40, y=50) AND the outer 6px white stroke (x=33, y=50) are masked!
+  const localW = region.bbox.w;
+  const glyphMaskVal = writeMask[(50 - 8) * localW + (40 - 8)];
+  const haloMaskVal = writeMask[(50 - 8) * localW + (33 - 8)];
+  assert.ok(glyphMaskVal >= 200, `Expected glyph core masked, got ${glyphMaskVal}`);
+  assert.ok(haloMaskVal >= 200, `Expected thick white stroke halo masked, got ${haloMaskVal}`);
+
+  // Clean via 2D smooth gradient plane and confirm reconstructed center matches blue gradient (NOT #FFFFFF white blob!)
+  const tier = tryCleanFlatOrGradientRing({
+    rgba,
+    imgWidth: w,
+    imgHeight: h,
+    region,
+    writeMask,
+    interiorCandidate,
+  });
+  assert.equal(tier, 'GRADIENT_PLANE');
+  const pCenter = (50 * w + 40) * 4;
+  assert.ok(rgba[pCenter] < 200 && rgba[pCenter + 2] > 215, `Expected blue gradient restore, got RGB(${rgba[pCenter]},${rgba[pCenter + 1]},${rgba[pCenter + 2]})`);
+});
+
+

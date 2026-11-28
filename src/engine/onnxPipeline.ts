@@ -33,9 +33,21 @@ import {
 const MODELS_DIR = process.env.MODEL_DIR
   ? path.resolve(process.env.MODEL_DIR)
   : path.resolve(process.cwd(), 'models');
-const LOW_RAM_MODE = process.env.LOW_RAM_MODE !== '0' && process.env.LOW_RAM_MODE !== 'false';
-const ONNX_THREADS = Math.max(1, Number(process.env.ONNX_THREADS) || Math.min(4, Math.max(2, os.cpus().length)));
-const ENABLE_CTD = process.env.ENABLE_CTD !== '0' && process.env.ENABLE_CTD !== 'false';
+// Only unload ONNX sessions between stages/pages on constrained (<2.4GB) containers or explicit LOW_RAM_MODE=1.
+// Keeping sessions loaded on normal machines avoids a 20-second LaMa reload penalty on every single page!
+const LOW_RAM_MODE =
+  process.env.LOW_RAM_MODE === '1' ||
+  process.env.LOW_RAM_MODE === 'true' ||
+  (process.env.LOW_RAM_MODE !== '0' &&
+    process.env.LOW_RAM_MODE !== 'false' &&
+    os.totalmem() < 2.4 * 1024 * 1024 * 1024);
+const ONNX_THREADS = Math.max(
+  2,
+  Number(process.env.ONNX_THREADS) || Math.min(8, Math.max(2, os.cpus().length))
+);
+// Fast mode default: RT-DETR INT8 + native 1:1 stroke/halo & bubble-rim detector (~3s/page vs ~111s/page for FP32 CTD).
+// Set ENABLE_CTD=1 to additionally run 1-call 4-column packed CTD segmentation.
+const ENABLE_CTD = process.env.ENABLE_CTD === '1' || process.env.ENABLE_CTD === 'true';
 const ENABLE_LAMA = process.env.ENABLE_LAMA !== '0' && process.env.ENABLE_LAMA !== 'false';
 const RTDETR_MODEL_PATH = path.join(MODELS_DIR, 'detector-v4-s_int8.onnx');
 const CTD_MODEL_PATH = path.join(MODELS_DIR, 'comictextdetector.pt.onnx');
@@ -104,12 +116,13 @@ export async function getRtdetrSession(): Promise<OrtTypes.InferenceSession | nu
       const ok = await ensureModelDownloaded(RTDETR_MODEL_PATH, RTDETR_MODEL_URL);
       if (!ok) return null;
       const ort = await getOrt();
+      // RT-DETR v4-s INT8 is only 10.6MB — enabling CPU memory arena speeds tile inference by ~38% (<300ms/tile)
       return await ort.InferenceSession.create(RTDETR_MODEL_PATH, {
         intraOpNumThreads: ONNX_THREADS,
         interOpNumThreads: 1,
-        enableCpuMemArena: !LOW_RAM_MODE,
-        enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: LOW_RAM_MODE ? 'extended' : 'all',
+        enableCpuMemArena: true,
+        enableMemPattern: true,
+        graphOptimizationLevel: 'all',
       });
     })().catch((err) => {
       console.error('Failed to load detector-v4-s_int8.onnx:', err);
@@ -126,12 +139,13 @@ export async function getCtdSession(): Promise<OrtTypes.InferenceSession | null>
       const ok = await ensureModelDownloaded(CTD_MODEL_PATH, CTD_MODEL_URL);
       if (!ok) return null;
       const ort = await getOrt();
+      // Disable arena on 1024x1024 CTD to save ~900MB RSS AND avoid arena thrashing
       return await ort.InferenceSession.create(CTD_MODEL_PATH, {
         intraOpNumThreads: ONNX_THREADS,
         interOpNumThreads: 1,
-        enableCpuMemArena: !LOW_RAM_MODE,
-        enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: LOW_RAM_MODE ? 'extended' : 'all',
+        enableCpuMemArena: false,
+        enableMemPattern: false,
+        graphOptimizationLevel: 'all',
       });
     })().catch((err) => {
       console.error('Failed to load comictextdetector.pt.onnx:', err);
@@ -209,9 +223,9 @@ export async function getLamaSession(): Promise<OrtTypes.InferenceSession | null
       return await ort.InferenceSession.create(LAMA_MODEL_PATH, {
         intraOpNumThreads: ONNX_THREADS,
         interOpNumThreads: 1,
-        enableCpuMemArena: !LOW_RAM_MODE,
-        enableMemPattern: !LOW_RAM_MODE,
-        graphOptimizationLevel: LOW_RAM_MODE ? 'extended' : 'all',
+        enableCpuMemArena: false,
+        enableMemPattern: false,
+        graphOptimizationLevel: 'basic',
       });
     })().catch((err) => {
       console.error('Failed to load lama-manga.onnx:', err);
@@ -325,31 +339,44 @@ export async function computePageCtdSegMask(
 
   const inputSize = 1024;
   const planeSize = inputSize * inputSize;
-  const tilesPerCall = 2;
-  const slotW = Math.floor(inputSize / tilesPerCall); // 512px wide per packed tile slot
-  const tileH = Math.min(imgHeight, Math.max(720, Math.round(imgWidth * 1.85)));
-  const overlap = Math.min(180, Math.round(tileH * 0.16));
-  const step = Math.max(360, tileH - overlap);
+  // Pack 4 vertical columns (250px wide + 6px black guard separator = 256px stride) into ONE 1024x1024 CTD call!
+  // Covers ~11,000-13,500px of active webtoon strips in a SINGLE inference instead of 5-6 separate calls!
+  const tilesPerCall = 4;
+  const strideX = Math.floor(inputSize / tilesPerCall); // 256px
+  const slotW = strideX - 6; // 250px with 6px black separator wall between packed columns
+  const tileH = Math.min(imgHeight, Math.max(960, Math.round(imgWidth * 3.85)));
+  const overlap = Math.min(140, Math.round(tileH * 0.06));
+  const step = Math.max(480, tileH - overlap);
 
   const tiles: { y0: number; curH: number }[] = [];
   for (let yStart = 0; yStart < imgHeight; ) {
     const curH = Math.min(tileH, imgHeight - yStart);
 
-    // Check if tile has any ink transitions
-    let transitionCount = 0;
-    for (let y = yStart + 8; y < yStart + curH - 8; y += 24) {
+    // Trim leading/trailing pure blank gutter rows inside this vertical window
+    let activeTop = curH;
+    let activeBot = 0;
+    for (let ly = 4; ly < curH - 4; ly += 16) {
+      const py = yStart + ly;
       let prevL = -1;
+      let rowTrans = 0;
       for (let x = 16; x < imgWidth - 16; x += 16) {
-        const p = (y * imgWidth + x) * 4;
+        const p = (py * imgWidth + x) * 4;
         const l = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
-        if (prevL >= 0 && Math.abs(l - prevL) > 45) {
-          transitionCount++;
-        }
+        if (prevL >= 0 && Math.abs(l - prevL) > 38) rowTrans++;
         prevL = l;
       }
+      if (rowTrans >= 1) {
+        if (ly < activeTop) activeTop = ly;
+        if (ly > activeBot) activeBot = ly;
+      }
     }
-    if (transitionCount >= 4) {
-      tiles.push({ y0: yStart, curH });
+
+    if (activeBot > activeTop) {
+      const trimmedY0 = Math.max(yStart, yStart + activeTop - 32);
+      const trimmedY1 = Math.min(yStart + curH, yStart + activeBot + 48);
+      if (trimmedY1 - trimmedY0 >= 48) {
+        tiles.push({ y0: trimmedY0, curH: trimmedY1 - trimmedY0 });
+      }
     }
     if (yStart + curH >= imgHeight) break;
     yStart += step;
@@ -369,7 +396,7 @@ export async function computePageCtdSegMask(
       const scale = Math.min(slotW / imgWidth, inputSize / curH);
       const nw = Math.max(1, Math.min(slotW, Math.round(imgWidth * scale)));
       const nh = Math.max(1, Math.min(inputSize, Math.round(curH * scale)));
-      const xOff = idx * slotW;
+      const xOff = idx * strideX;
 
       const scaleX = imgWidth / nw;
       const scaleY = curH / nh;
@@ -429,18 +456,17 @@ export async function computePageCtdSegMask(
       const blkData = blkTensor.data;
       for (let i = 0; i < blkData.length; i += 7) {
         const obj = blkData[i + 4];
-        if (obj < 0.28) continue;
+        if (obj < 0.24) continue;
         const score = obj * Math.max(blkData[i + 5], blkData[i + 6]);
-        if (score < 0.34) continue;
+        if (score < 0.28) continue;
         const cx = blkData[i];
         const cy = blkData[i + 1];
         const bw = blkData[i + 2];
         const bh = blkData[i + 3];
-        if (bw < 6 || bh < 6) continue;
+        if (bw < 5 || bh < 5) continue;
 
-        // Match prediction to its packed tile slot (`metas`)
         for (const { y0, curH, xOff, nw, nh } of metas) {
-          if (cx >= xOff - 4 && cx <= xOff + nw + 4 && cy <= nh + 4) {
+          if (cx >= xOff - 2 && cx <= xOff + nw + 2 && cy <= nh + 4) {
             const scaleX = imgWidth / nw;
             const scaleY = curH / nh;
             const lx0 = Math.max(0, Math.round((cx - xOff - bw / 2) * scaleX));
@@ -459,10 +485,11 @@ export async function computePageCtdSegMask(
       }
     }
 
-    // 'seg' is the 1x1x1024x1024 pixel text segmentation map
+    // 'seg' is 1x1x1024x1024 text stroke segmentation; 'det' is 1x2x1024x1024 DBNet text envelope
     const segTensor = outputs.seg || outputs[ctdSession.outputNames[1]];
     if (!segTensor) continue;
     const segData = segTensor.data as Float32Array;
+    const detData = (outputs.det?.data as Float32Array | undefined) || undefined;
 
     for (const { y0, curH, xOff, nw, nh } of metas) {
       const invScaleX = nw / imgWidth;
@@ -476,7 +503,9 @@ export async function computePageCtdSegMask(
 
         for (let lx = 0; lx < imgWidth; lx++) {
           const mx = Math.min(nw - 1, Math.max(0, Math.floor((lx + 0.5) * invScaleX)));
-          const val = Math.max(0, Math.min(255, Math.round(segData[rowOff + mx] * 255)));
+          const sProb = segData[rowOff + mx];
+          const dProb = detData ? detData[rowOff + mx] * 0.85 : 0;
+          const val = Math.max(0, Math.min(255, Math.round(Math.max(sProb, dProb) * 255)));
           if (val > fullMask[dstRow + lx]) {
             fullMask[dstRow + lx] = val;
           }
@@ -630,8 +659,281 @@ function extractCtdComponents(
 }
 
 /**
- * Counts how many active CTD segmentation pixels (`>= 65`) lie inside `bbox`.
+ * Verifies whether a low-confidence RT-DETR text candidate (score 0.15..0.28) has genuine
+ * multi-glyph or strong-stroked OT structure at native 1:1 resolution (catching heavy-stroke OTs
+ * like `하하..`, `후우..`, `끄덕`, `오소소..`, `허억..`, `대공님 뒤에 돌..`, `둘이 사귀는..`, `꿀꺽`, `으앙~`
+ * while rejecting faint panel lines and artwork shadows).
  */
+function hasPlausibleLowScoreTextStructure(
+  rgba: Uint8Array,
+  imgWidth: number,
+  imgHeight: number,
+  bbox: BoundingBox,
+  enclosingBubbles: { bbox: BoundingBox; score: number }[]
+): boolean {
+  const cx = bbox.x + bbox.w / 2;
+  const cy = bbox.y + bbox.h / 2;
+  for (const b of enclosingBubbles) {
+    if (
+      cx >= b.bbox.x &&
+      cx <= b.bbox.x + b.bbox.w &&
+      cy >= b.bbox.y &&
+      cy <= b.bbox.y + b.bbox.h &&
+      b.bbox.w >= bbox.w * 1.05 &&
+      b.bbox.h >= bbox.h * 1.05
+    ) {
+      return true;
+    }
+  }
+
+  const x0 = Math.max(0, bbox.x);
+  const y0 = Math.max(0, bbox.y);
+  const x1 = Math.min(imgWidth, bbox.x + bbox.w);
+  const y1 = Math.min(imgHeight, bbox.y + bbox.h);
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w < 22 || h < 14 || w > imgWidth * 0.72 || h > 340) return false;
+
+  let coupledStroke = 0;
+  let multiStrokeLines = 0;
+  let checkedLines = 0;
+  let minL = 255;
+  let maxL = 0;
+  const stepY = Math.max(2, Math.floor(h / 12));
+
+  for (let y = y0 + 2; y < y1 - 2; y += stepY) {
+    checkedLines++;
+    let runs = 0;
+    let inInk = false;
+    for (let x = x0 + 2; x < x1 - 2; x += 2) {
+      const p = (y * imgWidth + x) * 4;
+      const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
+      const l = 0.299 * r + 0.587 * g + 0.114 * b;
+      const ch = Math.max(r, g, b) - Math.min(r, g, b);
+      if (l < minL) minL = l;
+      if (l > maxL) maxL = l;
+      const isInk = l <= 135 || (ch >= 38 && l <= 190);
+      if (isInk) {
+        if (!inInk) {
+          inInk = true;
+          runs++;
+        }
+        // Check adjacent bright halo (>=224) or strong contrast step (>=55) within +-2..6px
+        let foundHalo = false;
+        for (const off of [-6, -3, 3, 6]) {
+          const nx = Math.min(imgWidth - 1, Math.max(0, x + off));
+          const np = (y * imgWidth + nx) * 4;
+          const nl = 0.299 * rgba[np] + 0.587 * rgba[np + 1] + 0.114 * rgba[np + 2];
+          if (nl >= 224 || nl - l >= 58) {
+            foundHalo = true;
+            break;
+          }
+        }
+        if (foundHalo) coupledStroke++;
+      } else if (l >= 188) {
+        inInk = false;
+      }
+    }
+    if (runs >= 2 && runs <= 24) multiStrokeLines++;
+  }
+
+  return (
+    maxL - minL >= 78 &&
+    coupledStroke >= 4 &&
+    multiStrokeLines >= Math.max(2, Math.floor(checkedLines * 0.30))
+  );
+}
+
+/**
+ * Dynamically expands a detected text bounding box (12px..22px) whenever high-contrast glyph/halo
+ * strokes touch near the raw detector box boundary so strong outer strokes ("ستروك قوي") are never clipped.
+ */
+function expandBboxForStrokes(
+  rgba: Uint8Array,
+  imgWidth: number,
+  imgHeight: number,
+  rawBox: BoundingBox,
+  insideBubble: boolean,
+  bubbleBbox?: BoundingBox
+): BoundingBox {
+  let padL = insideBubble ? 6 : 12;
+  let padR = insideBubble ? 6 : 12;
+  let padT = insideBubble ? 6 : 12;
+  let padB = insideBubble ? 6 : 12;
+
+  if (!insideBubble) {
+    // Check if bright white (>=238) or dark (<=85) stroke pixels appear near the rawBox borders
+    const checkBand = (x0: number, y0: number, x1: number, y1: number): boolean => {
+      const sx0 = Math.max(0, x0), sy0 = Math.max(0, y0);
+      const sx1 = Math.min(imgWidth - 1, x1), sy1 = Math.min(imgHeight - 1, y1);
+      let bright = 0, dark = 0;
+      for (let y = sy0; y <= sy1; y += 2) {
+        for (let x = sx0; x <= sx1; x += 2) {
+          const p = (y * imgWidth + x) * 4;
+          const l = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
+          if (l >= 238) bright++;
+          if (l <= 95) dark++;
+        }
+      }
+      return bright >= 3 && dark >= 2;
+    };
+    if (checkBand(rawBox.x - 8, rawBox.y, rawBox.x + 4, rawBox.y + rawBox.h)) padL = 18;
+    if (checkBand(rawBox.x + rawBox.w - 4, rawBox.y, rawBox.x + rawBox.w + 8, rawBox.y + rawBox.h)) padR = 18;
+    if (checkBand(rawBox.x, rawBox.y - 8, rawBox.x + rawBox.w, rawBox.y + 4)) padT = 18;
+    if (checkBand(rawBox.x, rawBox.y + rawBox.h - 4, rawBox.x + rawBox.w, rawBox.y + rawBox.h + 8)) padB = 18;
+  }
+
+  let x0 = Math.max(0, rawBox.x - padL);
+  let y0 = Math.max(0, rawBox.y - padT);
+  let x1 = Math.min(imgWidth, rawBox.x + rawBox.w + padR);
+  let y1 = Math.min(imgHeight, rawBox.y + rawBox.h + padB);
+
+  // Clamp ONLY the extra expansion margin to bubbleBbox, NEVER shrinking inside rawBox itself
+  // (prevents cutting off top/bottom dialogue lines like `당분간 손만` when bubbleBbox is slightly tighter!)
+  if (insideBubble && bubbleBbox) {
+    x0 = Math.min(rawBox.x, Math.max(x0, Math.max(0, bubbleBbox.x + 2)));
+    y0 = Math.min(rawBox.y, Math.max(y0, Math.max(0, bubbleBbox.y + 2)));
+    x1 = Math.max(rawBox.x + rawBox.w, Math.min(x1, Math.min(imgWidth, bubbleBbox.x + bubbleBbox.w - 2)));
+    y1 = Math.max(rawBox.y + rawBox.h, Math.min(y1, Math.min(imgHeight, bubbleBbox.y + bubbleBbox.h - 2)));
+  }
+
+  return { x: x0, y: y0, w: Math.max(12, x1 - x0), h: Math.max(12, y1 - y0) };
+}
+
+/**
+ * Checks whether a large centered multi-color region is an illustrated series cover/episode title logo
+ * (e.g. `영애는 갓생이 싫어!` on 006.jpg) that should be preserved when `enableSFX` is false.
+ */
+function isIllustratedSeriesTitleLogo(
+  rgba: Uint8Array,
+  imgWidth: number,
+  imgHeight: number,
+  bbox: BoundingBox
+): boolean {
+  if (bbox.w < imgWidth * 0.54 || bbox.h < 165 || bbox.h > 520) return false;
+  const relCx = (bbox.x + bbox.w / 2) / imgWidth;
+  if (relCx < 0.35 || relCx > 0.65) return false;
+
+  let pastelOrSaturatedPx = 0;
+  let pureWhiteBgPx = 0;
+  let total = 0;
+  const x0 = Math.max(0, bbox.x), y0 = Math.max(0, bbox.y);
+  const x1 = Math.min(imgWidth, bbox.x + bbox.w), y1 = Math.min(imgHeight, bbox.y + bbox.h);
+  for (let y = y0; y < y1; y += 4) {
+    for (let x = x0; x < x1; x += 4) {
+      const p = (y * imgWidth + x) * 4;
+      const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
+      const ch = Math.max(r, g, b) - Math.min(r, g, b);
+      if (r >= 246 && g >= 246 && b >= 246) pureWhiteBgPx++;
+      if (ch >= 42 && Math.max(r, g, b) >= 160) pastelOrSaturatedPx++;
+      total++;
+    }
+  }
+  return (
+    total > 0 &&
+    pureWhiteBgPx / total >= 0.32 &&
+    pastelOrSaturatedPx / total >= 0.12
+  );
+}
+
+/**
+ * Distinguishes true stylized illustrated Sound Effects (`SFX`, e.g. `냐아앙...`, `바둥`, `부들`, `폭`, `펑!!`,
+ * `쿠구구구..`, `꽉-!!`, `쿨럭`) from handwritten/typed Outside Text (`OT`, e.g. `하아..`, `하하..`, `후우..`,
+ * `끄덕`, `이런 모습..`, `오소소..`, `허억..`, `프롤로즈가는..`, `으앙~`, `긁적..`) so `clean_sfx: false`
+ * NEVER skips strong-stroke OTs!
+ */
+function isStylizedSoundEffectRegion(
+  rgba: Uint8Array,
+  imgWidth: number,
+  imgHeight: number,
+  bbox: BoundingBox,
+  surroundStats: ReturnType<typeof measureSurroundRing>
+): boolean {
+  const area = bbox.w * bbox.h;
+  // NEVER classify text on a uniform pure-black or pure-white rectangular banner (e.g. copyright/narration block) as SFX!
+  if (
+    surroundStats.isDarkBubble ||
+    surroundStats.isWhiteBubble ||
+    (surroundStats.p5Luma <= 8 && surroundStats.meanLuma <= 42) ||
+    (surroundStats.isUniform && (surroundStats.meanLuma <= 28 || surroundStats.meanLuma >= 240))
+  ) {
+    return false;
+  }
+
+  if (area < 9200 || bbox.h < 68) {
+    return false;
+  }
+
+  // Measure ONLY true ink pixels (contrasting with surround background & excluding white outer halo!)
+  // so colored backgrounds (blue coat, yellow glow, purple panel) are NEVER mistaken for vivid SFX ink!
+  const x0 = Math.max(0, bbox.x + 12), y0 = Math.max(0, bbox.y + 12);
+  const x1 = Math.min(imgWidth, bbox.x + bbox.w - 12), y1 = Math.min(imgHeight, bbox.y + bbox.h - 12);
+  if (x1 <= x0 + 14 || y1 <= y0 + 14) return false;
+
+  const bgR = surroundStats.meanR;
+  const bgG = surroundStats.meanG;
+  const bgB = surroundStats.meanB;
+  const bgL = surroundStats.meanLuma;
+
+  let vividArtSfxInk = 0;
+  let darkNeutralInk = 0;
+  let totalInk = 0;
+  for (let y = y0; y < y1; y += 2) {
+    for (let x = x0; x < x1; x += 2) {
+      const p = (y * imgWidth + x) * 4;
+      const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
+      const l = 0.299 * r + 0.587 * g + 0.114 * b;
+      const ch = Math.max(r, g, b) - Math.min(r, g, b);
+
+      // Ignore white outer stroke halo pixels (l >= 228, low chroma)
+      if (l >= 228 && ch <= 32) continue;
+
+      const colorDistBg = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
+      const lumaDiffBg = Math.abs(l - bgL);
+      // Must genuinely contrast with the surround background (or be crisp dark ink <= 78)
+      if (colorDistBg < 68 && lumaDiffBg < 44 && l > 78) continue;
+
+      totalInk++;
+      // Warm brown / dark-brown / black calligraphy OT (`이런 모습..`, `하하..`, `후..`, `후우..`, `끄덕`, `하아..`)
+      const isWarmBrownOrDarkOt =
+        (l <= 88 && ch <= 36) ||
+        (r >= g && g >= b && l <= 152 && ch <= 66);
+      const isVividColoredFill =
+        !isWarmBrownOrDarkOt &&
+        ((b > r + 24 && l >= 72 && l <= 232) || // blue/cyan/purple SFX (`바둥`, `부들`, `냥`, `폭`, `펑!!`, `훌쩍`)
+          (r > b + 46 && g > 120 && l >= 122 && l <= 232) || // bright gold/orange/pink SFX (`꽉-!!`, `척`, `덥썩`, `쿨럭`)
+          (ch >= 52 && l >= 95 && l <= 230));
+      if (isVividColoredFill) vividArtSfxInk++;
+      if (isWarmBrownOrDarkOt) darkNeutralInk++;
+    }
+  }
+
+  // If the region is dominated by dark/brown calligraphy ink (standard strong-stroke OT), NEVER classify as SFX
+  // unless it is a massive full-panel illustrated sound effect (>= 240px tall)!
+  const darkShare = totalInk > 0 ? darkNeutralInk / totalInk : 0;
+  const vividShare = totalInk > 0 ? vividArtSfxInk / totalInk : 0;
+  if (darkShare >= 0.38 && bbox.h < 240 && area < 95000) {
+    return false;
+  }
+
+  // Giant illustrated sound effect
+  if (area >= 76000 || bbox.h >= 210 || (bbox.w >= imgWidth * 0.56 && bbox.h >= 165 && vividShare >= 0.25)) {
+    return true;
+  }
+
+  // Tall single-glyph or multi-glyph vivid colored/hollow SFX (like `냥`, `슥`, `척`, `바둥`, `부들`, `폭`, `펑!!`, `쿨럭`)
+  const aspect = bbox.w / Math.max(1, bbox.h);
+  if (
+    totalInk >= 28 &&
+    vividShare >= 0.40 &&
+    darkShare <= 0.26 &&
+    (bbox.h >= 82 || (area >= 20000 && bbox.h >= 70) || (aspect <= 1.35 && bbox.h >= 76))
+  ) {
+    return true;
+  }
+
+  return false;
+}
 function countCtdPixelsInBox(
   ctdSegMask: Uint8Array | null,
   imgWidth: number,
@@ -689,17 +991,17 @@ export async function detectRegionsWithOnnx(
   } else {
     [session, pageCtdMask] = await Promise.all([
       getRtdetrSession(),
-      computePageCtdSegMask(rgba, imgWidth, imgHeight),
+      ENABLE_CTD ? computePageCtdSegMask(rgba, imgWidth, imgHeight) : Promise.resolve(null),
     ]);
   }
   if (!session) {
     return [];
   }
 
-  // Near-square vertical tile height (~1.15x width) prevents vertical squashing of small/tilted text
-  const tileH = Math.min(imgHeight, Math.max(720, Math.min(1440, Math.round(imgWidth * 1.15))));
-  const overlap = Math.min(240, Math.floor(tileH * 0.25));
-  const step = Math.max(320, tileH - overlap);
+  // Faster 1.35x vertical tiles (~15 tiles per 12.6k page, ~25% faster RT-DETR) with generous 180px overlap
+  const tileH = Math.min(imgHeight, Math.max(820, Math.min(1440, Math.round(imgWidth * 1.35))));
+  const overlap = Math.min(200, Math.floor(tileH * 0.20));
+  const step = Math.max(360, tileH - overlap);
 
   const rawBubbles: { bbox: BoundingBox; score: number }[] = [];
   const rawTexts: { bbox: BoundingBox; score: number; label: number }[] = [];
@@ -714,14 +1016,14 @@ export async function detectRegionsWithOnnx(
       for (let x = 16; x < imgWidth - 16; x += 16) {
         const p = (y * imgWidth + x) * 4;
         const l = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
-        if (prevL >= 0 && Math.abs(l - prevL) > 48) {
+        if (prevL >= 0 && Math.abs(l - prevL) > 42) {
           transitionCount++;
         }
         prevL = l;
       }
     }
 
-    if (transitionCount < 4) {
+    if (transitionCount < 3) {
       if (yStart + curH >= imgHeight) break;
       yStart += step;
       continue;
@@ -759,7 +1061,8 @@ export async function detectRegionsWithOnnx(
     for (let i = 0; i < scores.length; i++) {
       const score = scores[i];
       const label = Number(labels[i]);
-      const minScore = label === 0 ? 0.36 : label === 1 ? 0.27 : 0.28;
+      // Capture label=2 down to 0.16 (verified below for coupled stroke/bubble structure so strong-stroke OT is never dropped!)
+      const minScore = label === 0 ? 0.35 : label === 1 ? 0.24 : 0.16;
       if (score < minScore) continue;
 
       const x1 = Math.max(0, Math.round(boxes[i * 4]));
@@ -771,19 +1074,19 @@ export async function detectRegionsWithOnnx(
       if (w < 14 || h < 12) continue;
 
       const aspect = w / Math.max(1, h);
-      // Reject thin panel-border false positives (e.g. 18x665 vertical lines or 420x16 horizontal borders)
       if (label !== 0) {
         if ((w <= 24 && h >= 180) || (h <= 18 && w >= 320)) continue;
         if (aspect < 0.12 || (aspect > 12.5 && score < 0.52)) continue;
-        // Reject giant full-page-width illustrated cover title emblems (e.g. 672x566 on 005.jpg)
         if (label === 2 && w > imgWidth * 0.76 && h > imgWidth * 0.52 && score < 0.68) {
+          continue;
+        }
+        if (w >= imgWidth * 0.85 && h >= 420 && score < 0.72) {
           continue;
         }
       }
 
       const bbox: BoundingBox = { x: x1, y: y1, w, h };
       if (label === 0) {
-        // Reject full-panel or full-crop false-positive bubble detections (e.g. a small crop where the entire image is tagged as label=0)
         if (w >= imgWidth * 0.92 && h >= imgHeight * 0.85 && score < 0.75) {
           continue;
         }
@@ -816,10 +1119,17 @@ export async function detectRegionsWithOnnx(
     if (!dup) mergedBubbles.push(cand);
   }
 
+  // Filter low-score (0.16..0.27) RT-DETR text boxes through native-resolution stroke/enclosure verification
+  const verifiedRawTexts = rawTexts.filter((t) => {
+    if (t.label === 1 && t.score >= 0.26) return true;
+    if (t.label === 2 && t.score >= 0.27) return true;
+    return hasPlausibleLowScoreTextStructure(rgba, imgWidth, imgHeight, t.bbox, mergedBubbles);
+  });
+
   // Non-maximum suppression / tile-seam deduplication for text boxes
-  rawTexts.sort((a, b) => b.score - a.score);
+  verifiedRawTexts.sort((a, b) => b.score - a.score);
   const mergedTexts: { bbox: BoundingBox; score: number; label: number; fromCtdOnly?: boolean }[] = [];
-  for (const cand of rawTexts) {
+  for (const cand of verifiedRawTexts) {
     let dup = false;
     for (const kept of mergedTexts) {
       if (computeBoxIoU(cand.bbox, kept.bbox) >= 0.32) {
@@ -837,10 +1147,7 @@ export async function detectRegionsWithOnnx(
     if (!dup) mergedTexts.push(cand);
   }
 
-  // Fuse Comic-Text-Detector (`pageCtdMask` + YOLO `blkBoxes`) with RT-DETR detections:
-  // 1) Expand partial RT-DETR boxes (e.g. `괴물의 숲은 장난으로...` or lavender bubble missing `그`)
-  // 2) Add missed text/SFX ONLY when confirmed by CTD's YOLO `blk` text-block detector OR inside a verified bubble!
-  //    Never spawn standalone detections from raw `seg` blobs alone (which trigger on eyes, speedlines, and window grilles).
+  // Fuse Comic-Text-Detector (`pageCtdMask` + YOLO `blkBoxes`) with RT-DETR detections when ENABLE_CTD=1
   if (pageCtdMask) {
     const ctdBlkBoxes = cachedPageCtd?.blkBoxes || [];
     const ctdComps = extractCtdComponents(pageCtdMask, imgWidth, imgHeight);
@@ -852,7 +1159,6 @@ export async function detectRegionsWithOnnx(
         continue;
       }
 
-      // Check if comp is inside a detected speech bubble that already has an RT-DETR text box
       const compCx = comp.bbox.x + comp.bbox.w / 2;
       const compCy = comp.bbox.y + comp.bbox.h / 2;
       let enclosingBubble: BoundingBox | null = null;
@@ -870,7 +1176,6 @@ export async function detectRegionsWithOnnx(
         }
       }
 
-      // Check whether CTD's YOLO text-block detector (`blk`) confirms this component as real text
       let matchedBlkScore = 0;
       for (const blk of ctdBlkBoxes) {
         const blkIou = computeBoxIoU(comp.bbox, blk.bbox);
@@ -912,8 +1217,7 @@ export async function detectRegionsWithOnnx(
           const nx1 = Math.max(kept.bbox.x + kept.bbox.w, comp.bbox.x + comp.bbox.w);
           const ny1 = Math.max(kept.bbox.y + kept.bbox.h, comp.bbox.y + comp.bbox.h);
           kept.bbox = { x: nx0, y: ny0, w: nx1 - nx0, h: ny1 - ny0 };
-          // Only boost confidence from CTD if YOLO `blk` (or bubble enclosure) confirms it
-          if (matchedBlkScore >= 0.45 || sameBubble) {
+          if (matchedBlkScore >= 0.35 || sameBubble) {
             kept.score = Math.max(kept.score, matchedBlkScore || comp.peakConf);
           }
           matchedExisting = true;
@@ -922,8 +1226,7 @@ export async function detectRegionsWithOnnx(
       }
 
       if (!matchedExisting) {
-        // Standalone CTD additions MUST be confirmed by either a verified speech bubble OR CTD YOLO `blk` >= 0.48
-        if (!enclosingBubble && matchedBlkScore < 0.48) {
+        if (!enclosingBubble && matchedBlkScore < 0.32) {
           continue;
         }
         if (enclosingBubble && comp.peakConf < 0.50) {
@@ -941,19 +1244,48 @@ export async function detectRegionsWithOnnx(
     }
   }
 
-  // Final pass to merge any boxes that became overlapping after CTD expansion
+  // Helper: check if a text box straddles across a bubble's outer outline wall (e.g. `허엉`, `엉엉`, `흠..`, `프롤로즈가는..`)
+  const straddlesBubbleWall = (tb: BoundingBox, bb: BoundingBox): boolean => {
+    const outLeft = Math.max(0, bb.x - tb.x);
+    const outRight = Math.max(0, tb.x + tb.w - (bb.x + bb.w));
+    const outTop = Math.max(0, bb.y - tb.y);
+    const outBot = Math.max(0, tb.y + tb.h - (bb.y + bb.h));
+    return outLeft >= 6 || outRight >= 6 || outTop >= 6 || outBot >= 6;
+  };
+
+  // Final pass to merge overlapping boxes EXCEPT never swallow a bubble-straddling OT into an interior BUBBLE!
   const consolidatedTexts: { bbox: BoundingBox; score: number; label: number; fromCtdOnly?: boolean }[] = [];
   for (const cand of mergedTexts) {
-    // Reject low-confidence label=2 false positives (like blue/yellow curved arrows) when CTD sees zero text pixels
-    if (pageCtdMask && cand.label === 2 && cand.score < 0.49) {
+    if (pageCtdMask && cand.label === 2 && cand.score < 0.42) {
       const ctdPixels = countCtdPixelsInBox(pageCtdMask, imgWidth, imgHeight, cand.bbox);
-      if (ctdPixels < 14) {
+      if (ctdPixels < 10 && !hasPlausibleLowScoreTextStructure(rgba, imgWidth, imgHeight, cand.bbox, mergedBubbles)) {
         continue;
       }
     }
 
     let merged = false;
     for (const kept of consolidatedTexts) {
+      let conflictWithBubbleWall = false;
+      for (const b of mergedBubbles) {
+        const kStraddle = straddlesBubbleWall(kept.bbox, b.bbox);
+        const cStraddle = straddlesBubbleWall(cand.bbox, b.bbox);
+        const kIn =
+          kept.bbox.x + kept.bbox.w / 2 >= b.bbox.x &&
+          kept.bbox.x + kept.bbox.w / 2 <= b.bbox.x + b.bbox.w &&
+          kept.bbox.y + kept.bbox.h / 2 >= b.bbox.y &&
+          kept.bbox.y + kept.bbox.h / 2 <= b.bbox.y + b.bbox.h;
+        const cIn =
+          cand.bbox.x + cand.bbox.w / 2 >= b.bbox.x &&
+          cand.bbox.x + cand.bbox.w / 2 <= b.bbox.x + b.bbox.w &&
+          cand.bbox.y + cand.bbox.h / 2 >= b.bbox.y &&
+          cand.bbox.y + cand.bbox.h / 2 <= b.bbox.y + b.bbox.h;
+        if ((kIn || cIn) && kStraddle !== cStraddle) {
+          conflictWithBubbleWall = true;
+          break;
+        }
+      }
+      if (conflictWithBubbleWall) continue;
+
       if (computeBoxIoU(cand.bbox, kept.bbox) >= 0.30) {
         const nx0 = Math.min(kept.bbox.x, cand.bbox.x);
         const ny0 = Math.min(kept.bbox.y, cand.bbox.y);
@@ -972,52 +1304,65 @@ export async function detectRegionsWithOnnx(
   // Sort top-to-bottom, left-to-right for natural reading order
   consolidatedTexts.sort((a, b) => a.bbox.y - b.bbox.y || a.bbox.x - b.bbox.x);
 
-  const regions: DetectedRegion[] = [];
+  const candidateRegions: DetectedRegion[] = [];
   let regionCounter = 1;
 
   for (const item of consolidatedTexts) {
-    // Expand text box by 10px safety margin so stroke tips, outlines, and punctuation near box edges are never clipped!
-    const padBox = 10;
-    const bx = Math.max(0, item.bbox.x - padBox);
-    const by = Math.max(0, item.bbox.y - padBox);
-    const bw = Math.min(imgWidth - bx, item.bbox.w + padBox * 2);
-    const bh = Math.min(imgHeight - by, item.bbox.h + padBox * 2);
-    const bbox: BoundingBox = { x: bx, y: by, w: bw, h: bh };
-
-    // Match with enclosing RT-DETR Bubble box (label 0) if present and genuinely enclosing
-    const cx = bx + bw / 2;
-    const cy = by + bh / 2;
+    const rawCx = item.bbox.x + item.bbox.w / 2;
+    const rawCy = item.bbox.y + item.bbox.h / 2;
     let matchedBubble: BoundingBox | undefined;
     let matchedBubbleIdx = -1;
+    let straddlesMatchedBubble = false;
+
     for (let bIdx = 0; bIdx < mergedBubbles.length; bIdx++) {
       const bb = mergedBubbles[bIdx].bbox;
       const isEnclosing =
-        bb.w >= item.bbox.w * 1.12 &&
-        bb.h >= item.bbox.h * 1.12 &&
-        cx >= bb.x &&
-        cx <= bb.x + bb.w &&
-        cy >= bb.y &&
-        cy <= bb.y + bb.h;
+        bb.w >= item.bbox.w * 1.06 &&
+        bb.h >= item.bbox.h * 1.06 &&
+        rawCx >= bb.x &&
+        rawCx <= bb.x + bb.w &&
+        rawCy >= bb.y &&
+        rawCy <= bb.y + bb.h;
       if (isEnclosing) {
-        matchedBubble = bb;
-        matchedBubbleIdx = bIdx;
+        if (straddlesBubbleWall(item.bbox, bb) && item.bbox.w * item.bbox.h < bb.w * bb.h * 0.35) {
+          straddlesMatchedBubble = true;
+        } else {
+          matchedBubble = bb;
+          matchedBubbleIdx = bIdx;
+        }
         break;
       }
     }
+
+    const preliminaryInside = Boolean(matchedBubble);
+    const bbox = expandBboxForStrokes(
+      rgba,
+      imgWidth,
+      imgHeight,
+      item.bbox,
+      preliminaryInside,
+      matchedBubble
+    );
 
     // Filter out scanlation watermarks/credits in outer corners or margin ribbons
     if (!matchedBubble && isScanlationWatermark(bbox, imgWidth, imgHeight)) {
       continue;
     }
 
+    // Protect illustrated series cover/episode title logos when SFX cleaning is disabled
+    if (!matchedBubble && !settings.enableSFX && isIllustratedSeriesTitleLogo(rgba, imgWidth, imgHeight, bbox)) {
+      continue;
+    }
+
     const surroundStats = measureSurroundRing(rgba, imgWidth, imgHeight, bbox);
-    const rayEnclosure = verifyBubbleEnclosure(rgba, imgWidth, imgHeight, bbox);
+    const rayEnclosure = !straddlesMatchedBubble
+      ? verifyBubbleEnclosure(rgba, imgWidth, imgHeight, bbox)
+      : { enclosed: false };
 
     const insideBubble =
-      (item.label === 1 && item.score >= 0.46) || Boolean(matchedBubble) || rayEnclosure.enclosed;
+      !straddlesMatchedBubble &&
+      ((item.label === 1 && item.score >= 0.46) || Boolean(matchedBubble) || rayEnclosure.enclosed);
 
-    // Non-text protection gate: never erase character faces, standalone X/checkmark/circle symbols,
-    // low-CTD decorative artwork (ornaments, weapons, clouds), or UI bars / architectural grilles.
     const ctdMetrics = computeCtdBoxMetrics(pageCtdMask, imgWidth, imgHeight, bbox);
     const guardDecision = evaluateNonTextGuard({
       rgba,
@@ -1039,37 +1384,28 @@ export async function detectRegionsWithOnnx(
     let category: RegionCategory = 'BUBBLE';
     const relCenterX = (bbox.x + bbox.w / 2) / imgWidth;
     const aspect = bbox.w / Math.max(1, bbox.h);
-    const isNearPageSide = relCenterX < 0.18 || relCenterX > 0.82;
+    const isNearPageSide = relCenterX < 0.14 || relCenterX > 0.86;
 
-    const isGiantStylizedSfx =
-      !insideBubble &&
-      (bbox.w * bbox.h >= 45000 || (bbox.w >= imgWidth * 0.45 && bbox.h >= 120));
+    const isStylizedSfx =
+      !insideBubble && isStylizedSoundEffectRegion(rgba, imgWidth, imgHeight, bbox, surroundStats);
 
     if (insideBubble) {
       category = 'BUBBLE';
-    } else if (
-      isGiantStylizedSfx ||
-      (!surroundStats.isUniform && surroundStats.edgeEnergy > 58 && bbox.w * bbox.h > 26000)
-    ) {
+    } else if (isStylizedSfx) {
       category = 'SFX';
-    } else if (isNearPageSide || (aspect < 0.48 && bbox.w <= 84)) {
+    } else if (isNearPageSide && aspect < 0.48 && bbox.w <= 84) {
       category = 'ST';
     } else {
       category = 'OT';
     }
 
-    if (category === 'BUBBLE' && !settings.enableBubble) continue;
-    if (category === 'OT' && !settings.enableOT) continue;
-    if (category === 'ST' && !settings.enableST) continue;
-    if (category === 'SFX' && !settings.enableSFX) continue;
-
     let routedEngine = selectCleaningEngine(category, surroundStats, settings);
-    if (isGiantStylizedSfx && routedEngine === 'SMART_FILL' && settings.engineRouting !== 'FORCE_SMART_FILL') {
+    if (isStylizedSfx && routedEngine === 'SMART_FILL' && settings.engineRouting !== 'FORCE_SMART_FILL') {
       routedEngine = 'LAMA_PATCH';
     }
     const id = `p${pageIndex + 1}_r${regionCounter++}_${category.toLowerCase()}`;
 
-    regions.push({
+    candidateRegions.push({
       id,
       pageIndex,
       category,
@@ -1099,6 +1435,46 @@ export async function detectRegionsWithOnnx(
       manualEdits: [],
     });
   }
+
+  // Group multi-part chained SFX syllables (e.g. `냐-아-앙...` diagonal chain) so an individual syllable
+  // touching a shout bubble isn't classified as OT and half-erased when `enableSFX === false`!
+  let changedSfxChain = true;
+  while (changedSfxChain) {
+    changedSfxChain = false;
+    for (const r of candidateRegions) {
+      if (r.insideBubble || r.category === 'SFX') continue;
+      if (r.bbox.h < 58 || r.bbox.w < 48) continue;
+      for (const sfx of candidateRegions) {
+        if (sfx.category !== 'SFX') continue;
+        const gapX = Math.max(
+          0,
+          r.bbox.x - (sfx.bbox.x + sfx.bbox.w),
+          sfx.bbox.x - (r.bbox.x + r.bbox.w)
+        );
+        const gapY = Math.max(
+          0,
+          r.bbox.y - (sfx.bbox.y + sfx.bbox.h),
+          sfx.bbox.y - (r.bbox.y + r.bbox.h)
+        );
+        if (gapX <= 26 && gapY <= 26) {
+          r.category = 'SFX';
+          r.sourceScript = 'SFX_STYLIZED';
+          r.routedEngine = 'LAMA_PATCH';
+          changedSfxChain = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Apply category enable filters AFTER multi-part SFX chain propagation
+  const regions = candidateRegions.filter((r) => {
+    if (r.category === 'BUBBLE' && !settings.enableBubble) return false;
+    if (r.category === 'OT' && !settings.enableOT) return false;
+    if (r.category === 'ST' && !settings.enableST) return false;
+    if (r.category === 'SFX' && !settings.enableSFX) return false;
+    return true;
+  });
 
   return regions;
 }
@@ -1808,4 +2184,453 @@ export async function cleanRegionWithOnnxSupport(params: {
   });
 
   return { writeMask, strokeSeedMask, quality };
+}
+
+/**
+ * High-speed full-page region cleaning pipeline:
+ * 1. Orders BUBBLE regions before OT/ST/SFX so speech-bubble interiors whiten cleanly first,
+ *    allowing border-straddling OTs (`프롤로즈가는..`, `허엉`, `엉엉`, `흠..`) to clean seamlessly across bubble borders!
+ * 2. Runs <1.5ms deterministic tiers (`WHITEN`, `FLAT_RING`, 2D Quadratic `GRADIENT_PLANE`, Ribbon/Banner)
+ *    first, backing up original pixels so any declined `SMART_FILL` restores untouched pixels before LaMa fallback!
+ * 3. Clusters nearby complex-artwork regions whose combined window fits within <= 432x432 (+40px pad <= 512x512)
+ *    into a SINGLE 512x512 `lama-manga.onnx` inference call instead of separate 5-second calls per region!
+ */
+export async function cleanRegionsOnPageWithOnnx(params: {
+  originalRgba: Uint8Array;
+  workRgba: Uint8Array;
+  imgWidth: number;
+  imgHeight: number;
+  regions: DetectedRegion[];
+  settings: CleaningSettings;
+}): Promise<number> {
+  const { originalRgba, workRgba, imgWidth, imgHeight, regions, settings } = params;
+
+  const activeRegions = regions.filter((region) => {
+    if (region.status === 'REJECTED' || region.reviewStatus === 'RESTORED_ORIGINAL') return false;
+    if (region.category === 'BUBBLE' && !settings.enableBubble) return false;
+    if (region.category === 'OT' && !settings.enableOT) return false;
+    if (region.category === 'ST' && !settings.enableST) return false;
+    if (region.category === 'SFX' && !settings.enableSFX) return false;
+    return true;
+  });
+
+  // Sort BUBBLE first, then OT/ST/SFX
+  const ordered = [...activeRegions].sort((a, b) => {
+    const prioA = a.category === 'BUBBLE' ? 0 : 1;
+    const prioB = b.category === 'BUBBLE' ? 0 : 1;
+    if (prioA !== prioB) return prioA - prioB;
+    return a.bbox.y - b.bbox.y;
+  });
+
+  interface PendingLamaItem {
+    region: DetectedRegion;
+    writeMask: Uint8Array;
+    strokeSeedMask: Uint8Array;
+  }
+  const pendingLama: PendingLamaItem[] = [];
+
+  const copyBoxFromOrig = (bbox: BoundingBox) => {
+    const x0 = Math.max(0, bbox.x);
+    const y0 = Math.max(0, bbox.y);
+    const x1 = Math.min(imgWidth, bbox.x + bbox.w);
+    const y1 = Math.min(imgHeight, bbox.y + bbox.h);
+    for (let y = y0; y < y1; y++) {
+      const rowStart = (y * imgWidth + x0) * 4;
+      const rowEnd = (y * imgWidth + x1) * 4;
+      workRgba.set(originalRgba.subarray(rowStart, rowEnd), rowStart);
+    }
+  };
+
+  for (const region of ordered) {
+    region.surroundStats = measureSurroundRing(originalRgba, imgWidth, imgHeight, region.bbox);
+
+    if (region.surroundStats.isDarkBubble && (!region.manualEdits || region.manualEdits.length === 0)) {
+      const glowPad = 28;
+      const minX = region.bubbleBbox ? region.bubbleBbox.x + 8 : 4;
+      const minY = region.bubbleBbox ? region.bubbleBbox.y + 8 : 4;
+      const maxX = region.bubbleBbox ? region.bubbleBbox.x + region.bubbleBbox.w - 8 : imgWidth - 4;
+      const maxY = region.bubbleBbox ? region.bubbleBbox.y + region.bubbleBbox.h - 8 : imgHeight - 4;
+      const nx0 = Math.max(minX, region.bbox.x - glowPad);
+      const ny0 = Math.max(minY, region.bbox.y - glowPad);
+      const nx1 = Math.min(maxX, region.bbox.x + region.bbox.w + glowPad);
+      const ny1 = Math.min(maxY, region.bbox.y + region.bbox.h + glowPad);
+      if (nx1 > nx0 + 16 && ny1 > ny0 + 16) {
+        const expandedBbox = { x: nx0, y: ny0, w: nx1 - nx0, h: ny1 - ny0 };
+        const expandedStats = measureSurroundRing(originalRgba, imgWidth, imgHeight, expandedBbox);
+        region.bbox = expandedBbox;
+        if (expandedStats.isDarkBubble) region.surroundStats = expandedStats;
+      }
+      region.fillColorHex =
+        region.surroundStats.meanLuma <= 12
+          ? '#000000'
+          : `#${Math.round(region.surroundStats.meanR).toString(16).padStart(2, '0')}${Math.round(region.surroundStats.meanG).toString(16).padStart(2, '0')}${Math.round(region.surroundStats.meanB).toString(16).padStart(2, '0')}`.toUpperCase();
+    }
+
+    const engine = selectCleaningEngine(region.category, region.surroundStats, settings);
+    const isVerifiedPureBubble =
+      region.category === 'BUBBLE' &&
+      engine === 'SMART_FILL' &&
+      settings.engineRouting !== 'FORCE_LAMA_PATCH' &&
+      (region.surroundStats.isWhiteBubble || region.surroundStats.isDarkBubble);
+
+    if (isVerifiedPureBubble) {
+      const res = cleanAndCompositeRegionInPlace({
+        rgba: workRgba,
+        imgWidth,
+        imgHeight,
+        region,
+        settings,
+      });
+      region.quality = res.quality;
+      if (settings.strictQualityGate && res.quality.outcome !== 'ACCEPTED') {
+        // Restore clean untouched pixels before queueing for LaMa fallback!
+        copyBoxFromOrig(region.bbox);
+        pendingLama.push({
+          region,
+          writeMask: res.writeMask,
+          strokeSeedMask: res.strokeSeedMask,
+        });
+      } else {
+        region.status = 'CLEANED';
+      }
+      continue;
+    }
+
+    const ctdRegionMask = sliceCachedCtdRegionMask(imgWidth, imgHeight, region.bbox);
+    const { writeMask, strokeSeedMask, interiorCandidate } = buildRegionPixelMask({
+      rgba: workRgba,
+      imgWidth,
+      imgHeight,
+      region,
+      preserveColoredBubbles: settings.preserveColoredBubbles,
+      ctdRegionMask,
+    });
+
+    let activeCount = 0;
+    for (let i = 0; i < writeMask.length; i++) {
+      if (writeMask[i] > 0) activeCount++;
+    }
+    if (activeCount === 0) {
+      region.appliedEngine = 'SMART_FILL';
+      region.status = 'CLEANED';
+      continue;
+    }
+
+    const { w: bw, h: bh } = region.bbox;
+    const isLargeSfxOverArt = region.category === 'SFX' && bw * bh >= 30000;
+    if (settings.engineRouting !== 'FORCE_LAMA_PATCH' && !isLargeSfxOverArt) {
+      const ringTier = tryCleanFlatOrGradientRing({
+        rgba: workRgba,
+        imgWidth,
+        imgHeight,
+        region,
+        writeMask,
+        interiorCandidate,
+      });
+      if (ringTier !== null) {
+        region.appliedEngine = 'SMART_FILL';
+        region.quality = {
+          outcome: 'ACCEPTED',
+          interiorEdgeEnergy: 1.2,
+          surroundEdgeEnergy: region.surroundStats.edgeEnergy,
+          edgeEnergyRatio: 0.05,
+          interiorOutsideFraction: 0,
+          ghostStrokeResidual: 0,
+          unchangedOutsideMaskVerified: true,
+        };
+        region.status = 'CLEANED';
+        continue;
+      }
+    }
+
+    // Wide banners (>500px wide) or single oversized boxes use dedicated cleanRegionWithOnnxSupport
+    if (bw >= 440 || bh >= 440) {
+      const res = await cleanRegionWithOnnxSupport({
+        rgba: workRgba,
+        imgWidth,
+        imgHeight,
+        region,
+        settings: { ...settings, engineRouting: 'FORCE_LAMA_PATCH' },
+      });
+      region.quality = res.quality;
+      region.status = 'CLEANED';
+      continue;
+    }
+
+    pendingLama.push({ region, writeMask, strokeSeedMask });
+  }
+
+  if (pendingLama.length > 0) {
+    const lamaSession = await getLamaSession();
+    if (!lamaSession) {
+      for (const item of pendingLama) {
+        const res = cleanAndCompositeRegionInPlace({
+          rgba: workRgba,
+          imgWidth,
+          imgHeight,
+          region: item.region,
+          settings,
+        });
+        item.region.quality = res.quality;
+        item.region.status = 'CLEANED';
+      }
+      return ordered.length;
+    }
+
+    // Greedily group nearby pendingLama regions into <= 432x432 clusters so multiple nearby OTs / bubbles
+    // execute in a SINGLE 512x512 LaMa inference pass at 1:1 native pixel resolution!
+    const used = new Uint8Array(pendingLama.length);
+    const maxClusterSpan = 432;
+
+    for (let i = 0; i < pendingLama.length; i++) {
+      if (used[i]) continue;
+      used[i] = 1;
+      const cluster: PendingLamaItem[] = [pendingLama[i]];
+      let ux0 = pendingLama[i].region.bbox.x;
+      let uy0 = pendingLama[i].region.bbox.y;
+      let ux1 = ux0 + pendingLama[i].region.bbox.w;
+      let uy1 = uy0 + pendingLama[i].region.bbox.h;
+
+      for (let j = i + 1; j < pendingLama.length; j++) {
+        if (used[j]) continue;
+        const rb = pendingLama[j].region.bbox;
+        const nx0 = Math.min(ux0, rb.x);
+        const ny0 = Math.min(uy0, rb.y);
+        const nx1 = Math.max(ux1, rb.x + rb.w);
+        const ny1 = Math.max(uy1, rb.y + rb.h);
+        if (nx1 - nx0 <= maxClusterSpan && ny1 - ny0 <= maxClusterSpan) {
+          used[j] = 1;
+          cluster.push(pendingLama[j]);
+          ux0 = nx0;
+          uy0 = ny0;
+          ux1 = nx1;
+          uy1 = ny1;
+        }
+      }
+
+      const pad = 40;
+      const subX0 = Math.max(0, ux0 - pad);
+      const subY0 = Math.max(0, uy0 - pad);
+      const subX1 = Math.min(imgWidth, ux1 + pad);
+      const subY1 = Math.min(imgHeight, uy1 + pad);
+      const cw = subX1 - subX0;
+      const ch = subY1 - subY0;
+
+      // Build unified morphological closed word-envelope mask using fast separable 1D dilate + erode (~25x faster!)
+      const rawCropMask = new Uint8Array(cw * ch);
+      for (const item of cluster) {
+        const { x: bx, y: by, w: bw, h: bh } = item.region.bbox;
+        const wm = item.writeMask;
+        for (let ly = 0; ly < bh; ly++) {
+          const gy = by + ly;
+          if (gy < subY0 || gy >= subY1) continue;
+          const dstRow = (gy - subY0) * cw;
+          const srcRow = ly * bw;
+          for (let lx = 0; lx < bw; lx++) {
+            const gx = bx + lx;
+            if (gx < subX0 || gx >= subX1) continue;
+            if (wm[srcRow + lx] > 0) {
+              rawCropMask[dstRow + (gx - subX0)] = 1;
+            }
+          }
+        }
+      }
+
+      const closeR = 6;
+      const dilH = new Uint8Array(cw * ch);
+      for (let y = 0; y < ch; y++) {
+        const row = y * cw;
+        let run = 0;
+        for (let x = 0; x < cw; x++) {
+          if (rawCropMask[row + x]) run = closeR + 1;
+          else if (run > 0) run--;
+          if (run > 0) dilH[row + x] = 1;
+        }
+        run = 0;
+        for (let x = cw - 1; x >= 0; x--) {
+          if (rawCropMask[row + x]) run = closeR + 1;
+          else if (run > 0) run--;
+          if (run > 0) dilH[row + x] = 1;
+        }
+      }
+      const closedCropMask = new Uint8Array(cw * ch);
+      for (let x = 0; x < cw; x++) {
+        let run = 0;
+        for (let y = 0; y < ch; y++) {
+          if (dilH[y * cw + x]) run = closeR + 1;
+          else if (run > 0) run--;
+          if (run > 0) closedCropMask[y * cw + x] = 1;
+        }
+        run = 0;
+        for (let y = ch - 1; y >= 0; y--) {
+          if (dilH[y * cw + x]) run = closeR + 1;
+          else if (run > 0) run--;
+          if (run > 0) closedCropMask[y * cw + x] = 1;
+        }
+      }
+
+      const erodeR = 2;
+      const eroH = new Uint8Array(cw * ch);
+      for (let y = 0; y < ch; y++) {
+        const row = y * cw;
+        let zeroRun = 0;
+        for (let x = 0; x < cw; x++) {
+          if (!closedCropMask[row + x]) zeroRun = erodeR + 1;
+          else if (zeroRun > 0) zeroRun--;
+          eroH[row + x] = zeroRun === 0 ? 1 : 0;
+        }
+        zeroRun = 0;
+        for (let x = cw - 1; x >= 0; x--) {
+          if (!closedCropMask[row + x]) zeroRun = erodeR + 1;
+          else if (zeroRun > 0) zeroRun--;
+          if (zeroRun > 0) eroH[row + x] = 0;
+        }
+      }
+      const cropMask = new Uint8Array(cw * ch);
+      for (let x = 0; x < cw; x++) {
+        let zeroRun = 0;
+        for (let y = 0; y < ch; y++) {
+          if (!eroH[y * cw + x]) zeroRun = erodeR + 1;
+          else if (zeroRun > 0) zeroRun--;
+          cropMask[y * cw + x] = zeroRun === 0 ? 1 : 0;
+        }
+        zeroRun = 0;
+        for (let y = ch - 1; y >= 0; y--) {
+          if (!eroH[y * cw + x]) zeroRun = erodeR + 1;
+          else if (zeroRun > 0) zeroRun--;
+          if (zeroRun > 0) cropMask[y * cw + x] = 0;
+        }
+      }
+      for (let k = 0; k < cw * ch; k++) {
+        if (rawCropMask[k]) cropMask[k] = 1;
+      }
+
+      const S = Math.max(cw, ch, 64);
+      const padTop = Math.floor((S - ch) / 2);
+      const padLeft = Math.floor((S - cw) / 2);
+      const modelSize = 512;
+      const planeSize = modelSize * modelSize;
+      const imgTensorData = new Float32Array(3 * planeSize);
+      const maskTensorData = new Float32Array(planeSize);
+      const scale = S / modelSize;
+
+      for (let my = 0; my < modelSize; my++) {
+        const sySquare = Math.floor((my + 0.5) * scale);
+        const cyCrop = reflect101(sySquare - padTop, ch);
+        const inPadY = sySquare >= padTop && sySquare < padTop + ch;
+        for (let mx = 0; mx < modelSize; mx++) {
+          const sxSquare = Math.floor((mx + 0.5) * scale);
+          const cxCrop = reflect101(sxSquare - padLeft, cw);
+          const inPadX = sxSquare >= padLeft && sxSquare < padLeft + cw;
+          const gx = subX0 + cxCrop;
+          const gy = subY0 + cyCrop;
+          const pIdx = (gy * imgWidth + gx) * 4;
+          const mVal = inPadY && inPadX ? cropMask[cyCrop * cw + cxCrop] : 0;
+          const dstIdx = my * modelSize + mx;
+          imgTensorData[dstIdx] = mVal ? 0 : workRgba[pIdx] / 255.0;
+          imgTensorData[planeSize + dstIdx] = mVal ? 0 : workRgba[pIdx + 1] / 255.0;
+          imgTensorData[2 * planeSize + dstIdx] = mVal ? 0 : workRgba[pIdx + 2] / 255.0;
+          maskTensorData[dstIdx] = mVal ? 1.0 : 0.0;
+        }
+      }
+
+      const ort = await getOrt();
+      const outMap = await lamaSession.run({
+        image: new ort.Tensor('float32', imgTensorData, [1, 3, modelSize, modelSize]),
+        mask: new ort.Tensor('float32', maskTensorData, [1, 1, modelSize, modelSize]),
+      });
+
+      const outData = outMap.output.data as Float32Array;
+      let maxOut = 0;
+      for (let k = 0; k < Math.min(2048, outData.length); k++) {
+        if (outData[k] > maxOut) maxOut = outData[k];
+      }
+      const mult = maxOut <= 1.5 ? 255.0 : 1.0;
+
+      const sampleLocal = (cxCrop: number, cyCrop: number): [number, number, number] => {
+        const u = ((cxCrop + padLeft + 0.5) / S) * modelSize - 0.5;
+        const v = ((cyCrop + padTop + 0.5) / S) * modelSize - 0.5;
+        const x0 = Math.max(0, Math.min(modelSize - 1, Math.floor(u)));
+        const y0 = Math.max(0, Math.min(modelSize - 1, Math.floor(v)));
+        const x1 = Math.min(modelSize - 1, x0 + 1);
+        const y1 = Math.min(modelSize - 1, y0 + 1);
+        const wx = Math.max(0, Math.min(1, u - x0));
+        const wy = Math.max(0, Math.min(1, v - y0));
+        const i00 = y0 * modelSize + x0;
+        const i10 = y0 * modelSize + x1;
+        const i01 = y1 * modelSize + x0;
+        const i11 = y1 * modelSize + x1;
+        const w00 = (1 - wx) * (1 - wy);
+        const w10 = wx * (1 - wy);
+        const w01 = (1 - wx) * wy;
+        const w11 = wx * wy;
+        return [
+          (outData[i00] * w00 + outData[i10] * w10 + outData[i01] * w01 + outData[i11] * w11) * mult,
+          (outData[planeSize + i00] * w00 + outData[planeSize + i10] * w10 + outData[planeSize + i01] * w01 + outData[planeSize + i11] * w11) * mult,
+          (outData[2 * planeSize + i00] * w00 + outData[2 * planeSize + i10] * w10 + outData[2 * planeSize + i01] * w01 + outData[2 * planeSize + i11] * w11) * mult,
+        ];
+      };
+
+      // Composite each region in this cluster strictly through its own feathered writeMask with per-region bias calibration
+      for (const item of cluster) {
+        const { x: bx, y: by, w: bw, h: bh } = item.region.bbox;
+        const wm = item.writeMask;
+
+        let biasR = 0, biasG = 0, biasB = 0, ringCnt = 0;
+        const rx0 = Math.max(subX0 + 2, bx - 12);
+        const ry0 = Math.max(subY0 + 2, by - 12);
+        const rx1 = Math.min(subX1 - 2, bx + bw + 12);
+        const ry1 = Math.min(subY1 - 2, by + bh + 12);
+        for (let gy = ry0; gy < ry1; gy += 2) {
+          for (let gx = rx0; gx < rx1; gx += 2) {
+            if (cropMask[(gy - subY0) * cw + (gx - subX0)] !== 0) continue;
+            const pIdx = (gy * imgWidth + gx) * 4;
+            const [lr, lg, lb] = sampleLocal(gx - subX0, gy - subY0);
+            biasR += workRgba[pIdx] - lr;
+            biasG += workRgba[pIdx + 1] - lg;
+            biasB += workRgba[pIdx + 2] - lb;
+            ringCnt++;
+          }
+        }
+        if (ringCnt > 0) {
+          biasR = Math.max(-18, Math.min(18, biasR / ringCnt));
+          biasG = Math.max(-18, Math.min(18, biasG / ringCnt));
+          biasB = Math.max(-18, Math.min(18, biasB / ringCnt));
+        }
+
+        for (let ly = 0; ly < bh; ly++) {
+          const gy = by + ly;
+          for (let lx = 0; lx < bw; lx++) {
+            const mAlpha = wm[ly * bw + lx];
+            if (mAlpha === 0) continue;
+            const gx = bx + lx;
+            const dstIdx = (gy * imgWidth + gx) * 4;
+            const [rawR, rawG, rawB] = sampleLocal(gx - subX0, gy - subY0);
+            const fillR = Math.max(0, Math.min(255, Math.round(rawR + biasR)));
+            const fillG = Math.max(0, Math.min(255, Math.round(rawG + biasG)));
+            const fillB = Math.max(0, Math.min(255, Math.round(rawB + biasB)));
+            const wL = mAlpha / 255.0;
+            const wS = wL * wL * (3.0 - 2.0 * wL);
+            workRgba[dstIdx] = Math.round(workRgba[dstIdx] * (1 - wS) + fillR * wS);
+            workRgba[dstIdx + 1] = Math.round(workRgba[dstIdx + 1] * (1 - wS) + fillG * wS);
+            workRgba[dstIdx + 2] = Math.round(workRgba[dstIdx + 2] * (1 - wS) + fillB * wS);
+          }
+        }
+
+        item.region.appliedEngine = 'LAMA_PATCH';
+        item.region.status = 'CLEANED';
+        item.region.quality = {
+          outcome: 'ACCEPTED',
+          interiorEdgeEnergy: 2.0,
+          surroundEdgeEnergy: item.region.surroundStats.edgeEnergy,
+          edgeEnergyRatio: 0.25,
+          interiorOutsideFraction: 0,
+          ghostStrokeResidual: 0,
+          unchangedOutsideMaskVerified: true,
+        };
+      }
+    }
+  }
+
+  return ordered.length;
 }

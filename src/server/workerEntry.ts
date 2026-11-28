@@ -18,13 +18,14 @@ const DEFAULT_WORKER_SETTINGS: CleaningSettings = {
   enableST: true,
   enableSFX: false,
   bubbleCleanMode: 'WHITEN',
-  engineRouting: 'AUTO',
+  engineRouting: 'AUTO_LADDER',
+  sourceLanguages: ['KO', 'JA', 'ZH', 'EN'],
   strictQualityGate: true,
   maxStripWindowHeight: 2048,
-  autoReviewFlagSfx: true,
-  defaultPaddingPx: 6,
-  defaultFeatherPx: 3,
+  defaultPaddingPx: 4,
+  defaultFeatherPx: 2,
   preserveColoredBubbles: true,
+  cloudGpuConsent: false,
 };
 
 interface WorkerJobRecord {

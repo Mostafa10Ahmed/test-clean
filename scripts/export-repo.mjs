@@ -6,6 +6,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { pathToFileURL } from 'url';
 import JSZip from 'jszip';
 
 const ROOT = process.cwd();
@@ -87,7 +88,7 @@ export async function buildTestCleanRepoZip() {
   };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   buildTestCleanRepoZip()
     .then((res) => {
       console.log(

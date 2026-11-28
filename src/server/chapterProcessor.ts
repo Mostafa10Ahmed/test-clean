@@ -1,18 +1,22 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import sharp from 'sharp';
 sharp.cache(false);
-sharp.concurrency(1);
+sharp.concurrency(Math.min(4, Math.max(1, os.cpus().length)));
 import JSZip from 'jszip';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
-  cleanAndCompositeRegionInPlace,
   computeStripWindows,
   sortPageNamesNaturally,
   verifyBitIdenticalOutsideMasks,
 } from '../engine/cleanerCore';
 import { detectRegionsInRgbaBuffer, measureSurroundRing } from '../engine/detector';
-import { cleanRegionWithOnnxSupport, detectRegionsWithOnnx } from '../engine/onnxPipeline';
+import {
+  cleanRegionsOnPageWithOnnx,
+  clearPageCtdCache,
+  detectRegionsWithOnnx,
+} from '../engine/onnxPipeline';
 import {
   applyRunOverrides,
   parseCleanCommandArgs,
@@ -269,82 +273,14 @@ export class ChapterCleaningManager {
     if (mode === 'DETECT_AND_CLEAN' || mode === 'CLEAN_EXISTING') {
       const workRgba = new Uint8Array(originalRgba);
 
-      for (const region of regions) {
-        if (region.status === 'REJECTED' || region.reviewStatus === 'RESTORED_ORIGINAL') {
-          continue;
-        }
-        // Check if category is enabled in current settings
-        if (region.category === 'BUBBLE' && !job.settings.enableBubble) continue;
-        if (region.category === 'OT' && !job.settings.enableOT) continue;
-        if (region.category === 'ST' && !job.settings.enableST) continue;
-        if (region.category === 'SFX' && !job.settings.enableSFX) continue;
-
-        // Refresh surroundStats from originalRgba
-        region.surroundStats = measureSurroundRing(originalRgba, width, height, region.bbox);
-
-        // If this is a dark speech bubble with glowing text, expand bbox up to 28px inside the dark interior
-        // so wide outer-glow halos (e.g., 25px brown/colored glow around white text) are 100% enclosed
-        if (region.surroundStats.isDarkBubble && region.manualEdits.length === 0) {
-          const glowPad = 28;
-          const minX = region.bubbleBbox ? region.bubbleBbox.x + 8 : 4;
-          const minY = region.bubbleBbox ? region.bubbleBbox.y + 8 : 4;
-          const maxX = region.bubbleBbox
-            ? region.bubbleBbox.x + region.bubbleBbox.w - 8
-            : width - 4;
-          const maxY = region.bubbleBbox
-            ? region.bubbleBbox.y + region.bubbleBbox.h - 8
-            : height - 4;
-
-          const nx0 = Math.max(minX, region.bbox.x - glowPad);
-          const ny0 = Math.max(minY, region.bbox.y - glowPad);
-          const nx1 = Math.min(maxX, region.bbox.x + region.bbox.w + glowPad);
-          const ny1 = Math.min(maxY, region.bbox.y + region.bbox.h + glowPad);
-          if (nx1 > nx0 + 16 && ny1 > ny0 + 16) {
-            const expandedBbox = { x: nx0, y: ny0, w: nx1 - nx0, h: ny1 - ny0 };
-            const expandedStats = measureSurroundRing(originalRgba, width, height, expandedBbox);
-            region.bbox = expandedBbox;
-            if (expandedStats.isDarkBubble) {
-              region.surroundStats = expandedStats;
-            }
-          }
-          region.fillColorHex =
-            region.surroundStats.meanLuma <= 12
-              ? '#000000'
-              : `#${Math.round(region.surroundStats.meanR).toString(16).padStart(2, '0')}${Math.round(region.surroundStats.meanG).toString(16).padStart(2, '0')}${Math.round(region.surroundStats.meanB).toString(16).padStart(2, '0')}`.toUpperCase();
-        }
-
-        const { quality } = await cleanRegionWithOnnxSupport({
-          rgba: workRgba,
-          imgWidth: width,
-          imgHeight: height,
-          region,
-          settings: job.settings,
-        });
-
-        region.quality = quality;
-
-        if (job.settings.strictQualityGate && quality.outcome !== 'ACCEPTED') {
-          // Try fallback engine (LAMA_PATCH) if SMART_FILL declined
-          if (region.appliedEngine === 'SMART_FILL') {
-            const fallbackSettings: CleaningSettings = {
-              ...job.settings,
-              engineRouting: 'FORCE_LAMA_PATCH',
-            };
-            const retry = await cleanRegionWithOnnxSupport({
-              rgba: workRgba,
-              imgWidth: width,
-              imgHeight: height,
-              region,
-              settings: fallbackSettings,
-            });
-            retry.quality.fallbackUsed = 'LAMA_PATCH';
-            region.quality = retry.quality;
-          }
-        }
-
-        region.status = 'CLEANED';
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
+      await cleanRegionsOnPageWithOnnx({
+        originalRgba,
+        workRgba,
+        imgWidth: width,
+        imgHeight: height,
+        regions,
+        settings: job.settings,
+      });
 
       // Verify bit-identical guarantee outside masks
       const verification = verifyBitIdenticalOutsideMasks(
@@ -367,15 +303,13 @@ export class ChapterCleaningManager {
         raw: { width, height, channels: 4 },
         limitInputPixels: false,
       })
-        .png({ compressionLevel: 6 })
+        .png({ compressionLevel: 3 })
         .toFile(outPngPath);
 
       cleanedUrl = `/cleaned/${job.id}/${outPngName}?v=${Date.now()}`;
     }
 
-    if (process.env.LOW_RAM_MODE !== '0') {
-      clearPageCtdCache();
-    }
+    clearPageCtdCache();
     const memUsageMb = Number((process.memoryUsage().rss / 1024 / 1024).toFixed(1));
     console.log(`[Cleaner] Page ${pageIndex + 1}/${job.totalPages} (${page.fileName}) done in ${Math.round(performance.now() - t0)}ms | RSS=${memUsageMb}MB`);
     const elapsedMs = Math.round(performance.now() - t0);

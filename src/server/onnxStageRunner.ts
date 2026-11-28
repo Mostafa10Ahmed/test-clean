@@ -1,21 +1,22 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import sharp from 'sharp';
 import {
   computePageCtdSegMask,
   detectRegionsWithOnnx,
-  cleanRegionWithOnnxSupport,
+  cleanRegionsOnPageWithOnnx,
   getCachedPageCtd,
   setCachedPageCtd,
   clearPageCtdCache,
   releaseAllOnnxSessions,
 } from '../engine/onnxPipeline';
-import { detectRegionsInRgbaBuffer, measureSurroundRing } from '../engine/detector';
+import { detectRegionsInRgbaBuffer } from '../engine/detector';
 import { CleaningSettings, DetectedRegion } from '../engine/types';
 import { createTwoLayerPsd } from '../engine/psdWriter';
 
 sharp.cache(false);
-sharp.concurrency(1);
+sharp.concurrency(Math.min(4, Math.max(1, os.cpus().length)));
 
 interface BatchManifest {
   pages: {
@@ -158,58 +159,14 @@ async function runCleanBatch(manifest: BatchManifest) {
       : [];
     const workRgba = new Uint8Array(rgba);
     const settings = manifest.settings;
-    let cleanedCount = 0;
-
-    for (const region of regions) {
-      if (region.status === 'REJECTED' || region.reviewStatus === 'RESTORED_ORIGINAL') continue;
-      if (region.category === 'BUBBLE' && !settings.enableBubble) continue;
-      if (region.category === 'OT' && !settings.enableOT) continue;
-      if (region.category === 'ST' && !settings.enableST) continue;
-      if (region.category === 'SFX' && !settings.enableSFX) continue;
-
-      region.surroundStats = measureSurroundRing(rgba, width, height, region.bbox);
-
-      if (region.surroundStats.isDarkBubble && (!region.manualEdits || region.manualEdits.length === 0)) {
-        const glowPad = 28;
-        const minX = region.bubbleBbox ? region.bubbleBbox.x + 8 : 4;
-        const minY = region.bubbleBbox ? region.bubbleBbox.y + 8 : 4;
-        const maxX = region.bubbleBbox ? region.bubbleBbox.x + region.bubbleBbox.w - 8 : width - 4;
-        const maxY = region.bubbleBbox ? region.bubbleBbox.y + region.bubbleBbox.h - 8 : height - 4;
-        const nx0 = Math.max(minX, region.bbox.x - glowPad);
-        const ny0 = Math.max(minY, region.bbox.y - glowPad);
-        const nx1 = Math.min(maxX, region.bbox.x + region.bbox.w + glowPad);
-        const ny1 = Math.min(maxY, region.bbox.y + region.bbox.h + glowPad);
-        if (nx1 > nx0 + 16 && ny1 > ny0 + 16) {
-          const expandedBbox = { x: nx0, y: ny0, w: nx1 - nx0, h: ny1 - ny0 };
-          const expandedStats = measureSurroundRing(rgba, width, height, expandedBbox);
-          region.bbox = expandedBbox;
-          if (expandedStats.isDarkBubble) region.surroundStats = expandedStats;
-        }
-        region.fillColorHex =
-          region.surroundStats.meanLuma <= 12
-            ? '#000000'
-            : `#${Math.round(region.surroundStats.meanR).toString(16).padStart(2, '0')}${Math.round(region.surroundStats.meanG).toString(16).padStart(2, '0')}${Math.round(region.surroundStats.meanB).toString(16).padStart(2, '0')}`.toUpperCase();
-      }
-
-      const { quality } = await cleanRegionWithOnnxSupport({
-        rgba: workRgba,
-        imgWidth: width,
-        imgHeight: height,
-        region,
-        settings,
-      });
-
-      if (settings.strictQualityGate && quality.outcome !== 'ACCEPTED' && region.appliedEngine === 'SMART_FILL') {
-        await cleanRegionWithOnnxSupport({
-          rgba: workRgba,
-          imgWidth: width,
-          imgHeight: height,
-          region,
-          settings: { ...settings, engineRouting: 'FORCE_LAMA_PATCH' },
-        });
-      }
-      cleanedCount++;
-    }
+    const cleanedCount = await cleanRegionsOnPageWithOnnx({
+      originalRgba: rgba,
+      workRgba,
+      imgWidth: width,
+      imgHeight: height,
+      regions,
+      settings,
+    });
 
     const fmt = manifest.outputFormat || 'jpg';
     if (fmt === 'psd') {

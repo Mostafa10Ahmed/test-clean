@@ -422,3 +422,43 @@ test('rejects border-straddling vertical comic stitch mark on speech bubble edge
   assert.equal(res.reason, 'NON_TEXT_UI_PATTERN');
 });
 
+test('rejects low-contrast uniform embroidery and single-blob isolated eye false positive without CTD', () => {
+  // 1) Isolated single cat/character eye false positive
+  const ew = 80, eh = 80;
+  const eyeImg = createCanvas(ew, eh, 165, 172, 182);
+  drawFilledCircle(eyeImg, ew, eh, 40, 40, 14, 235, 220, 130); // yellow iris
+  drawFilledCircle(eyeImg, ew, eh, 40, 40, 8, 25, 25, 30); // single dark pupil
+  const eyeRes = evaluateNonTextGuard({
+    rgba: eyeImg,
+    imgWidth: ew,
+    imgHeight: eh,
+    bbox: { x: 10, y: 10, w: 56, h: 56 },
+    confidence: 0.44,
+    insideBubble: false,
+    surroundStats: COMPLEX_ART_SURROUND,
+    ctdMetrics: null,
+  });
+  assert.equal(eyeRes.reject, true);
+  assert.equal(eyeRes.reason, 'NO_TEXT_CONSENSUS');
+
+  // 2) Low-contrast silver/grey uniform embroidery
+  const w = 200, h = 80;
+  const embImg = createCanvas(w, h, 228, 232, 238);
+  for (let x = 20; x < 180; x += 22) {
+    drawFilledCircle(embImg, w, h, x, 40, 7, 165, 170, 178);
+  }
+  const embRes = evaluateNonTextGuard({
+    rgba: embImg,
+    imgWidth: w,
+    imgHeight: h,
+    bbox: { x: 10, y: 10, w: 180, h: 60 },
+    confidence: 0.35,
+    insideBubble: false,
+    surroundStats: COMPLEX_ART_SURROUND,
+    ctdMetrics: null,
+  });
+  assert.equal(embRes.reject, true);
+  assert.equal(embRes.reason, 'NO_TEXT_CONSENSUS');
+});
+
+

@@ -85,7 +85,7 @@ export async function cleanWithRemoteWorker(req: RemoteCleanRequest): Promise<Re
   const maxWaitMs = Number(process.env.WORKER_TIMEOUT_MS) || 45 * 60 * 1000;
   const startedAt = Date.now();
 
-  let statusPayload: {
+  interface WorkerStatusPayload {
     status: string;
     stage?: string;
     queuePosition?: number;
@@ -97,7 +97,9 @@ export async function cleanWithRemoteWorker(req: RemoteCleanRequest): Promise<Re
     bubbleCleanMode?: BubbleCleanMode;
     outputFileName?: string;
     error?: string;
-  } | null = null;
+  }
+
+  let statusPayload: WorkerStatusPayload | null = null;
 
   let consecutiveErrors = 0;
 
@@ -118,7 +120,7 @@ export async function cleanWithRemoteWorker(req: RemoteCleanRequest): Promise<Re
         continue;
       }
       consecutiveErrors = 0;
-      statusPayload = (await pollRes.json()) as typeof statusPayload;
+      statusPayload = (await pollRes.json()) as WorkerStatusPayload;
       if (statusPayload) {
         req.onProgress?.({
           status: statusPayload.status,

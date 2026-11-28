@@ -159,8 +159,8 @@ export async function runIsolatedWorkerJob(params: {
   const manifestPath = path.join(jobRoot, 'manifest.json');
   fs.writeFileSync(manifestPath, JSON.stringify({ pages, settings, outputFormat }), 'utf-8');
 
-  // Stage 1 (BATCH): CTD loads ONCE for entire chapter, then exits (100% RAM reclaimed!)
-  if (process.env.ENABLE_CTD !== '0' && process.env.ENABLE_CTD !== 'false') {
+  // Stage 1 (BATCH, optional when ENABLE_CTD=1): CTD loads ONCE for entire chapter, then exits
+  if (process.env.ENABLE_CTD === '1' || process.env.ENABLE_CTD === 'true') {
     params.onProgress?.({ stage: 'DETECTING_CTD', currentPage: 1, totalPages: pages.length });
     const ctdRes = await runBatchSubprocess('ctd', manifestPath, {}, params.onProgress);
     if (!ctdRes.ok) {

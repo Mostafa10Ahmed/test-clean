@@ -1020,6 +1020,113 @@ export function detectNonTextUiOrArchitecturalPattern(
 }
 
 /**
+ * Native-resolution check for genuine multi-glyph coupled stroke+halo text (e.g. heavy-stroke OT
+ * `하하..`, `후우..`, `끄덕`, `이런 모습..`, `오소소..`) so face/artwork guards never falsely reject real OT,
+ * while standalone artwork false positives (cat eye, uniform embroidery, empty dashed boxes, mouth,
+ * breath puffs, sweat drops) are cleanly rejected even when full-page CTD is disabled!
+ */
+export function analyzeNativeGlyphConsensus(
+  rgba: Uint8Array,
+  imgWidth: number,
+  imgHeight: number,
+  bbox: BoundingBox
+): {
+  hasStrokedGlyphs: boolean;
+  interiorGlyphComps: number;
+  inkFraction: number;
+  contrastSpan: number;
+  minLuma: number;
+  maxLuma: number;
+} {
+  const x = Math.max(0, Math.floor(bbox.x));
+  const y = Math.max(0, Math.floor(bbox.y));
+  const w = Math.min(imgWidth - x, Math.ceil(bbox.w));
+  const h = Math.min(imgHeight - y, Math.ceil(bbox.h));
+  if (w < 12 || h < 10) {
+    return {
+      hasStrokedGlyphs: false,
+      interiorGlyphComps: 0,
+      inkFraction: 0,
+      contrastSpan: 0,
+      minLuma: 255,
+      maxLuma: 0,
+    };
+  }
+
+  let minLuma = 255;
+  let maxLuma = 0;
+  const lumas = new Float32Array(w * h);
+  const chromas = new Uint8Array(w * h);
+  const rimLumas: number[] = [];
+
+  for (let ly = 0; ly < h; ly++) {
+    for (let lx = 0; lx < w; lx++) {
+      const p = ((y + ly) * imgWidth + (x + lx)) * 4;
+      const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
+      const l = rgbToLuma(r, g, b);
+      const idx = ly * w + lx;
+      lumas[idx] = l;
+      chromas[idx] = Math.max(r, g, b) - Math.min(r, g, b);
+      if (l < minLuma) minLuma = l;
+      if (l > maxLuma) maxLuma = l;
+      if (lx <= 2 || lx >= w - 3 || ly <= 2 || ly >= h - 3) {
+        if ((lx + ly) % 2 === 0) rimLumas.push(l);
+      }
+    }
+  }
+
+  rimLumas.sort((a, b) => a - b);
+  const bgLuma = rimLumas.length > 0 ? rimLumas[Math.floor(rimLumas.length * 0.5)] : 240;
+  const contrastSpan = maxLuma - minLuma;
+
+  const inkMask = new Uint8Array(w * h);
+  let inkPx = 0;
+  let coupledStrokePairs = 0;
+
+  for (let ly = 2; ly < h - 2; ly++) {
+    for (let lx = 2; lx < w - 2; lx++) {
+      const idx = ly * w + lx;
+      const l = lumas[idx];
+      if (Math.abs(l - bgLuma) >= 42 || (bgLuma >= 140 && l <= 95) || (bgLuma < 100 && l >= 205)) {
+        inkMask[idx] = 1;
+        inkPx++;
+      }
+      if ((lx & 1) === 0 && (ly & 1) === 0 && (l <= 115 || (chromas[idx] >= 45 && l <= 175))) {
+        let nearWhite = false;
+        for (let dy = -5; dy <= 5 && !nearWhite; dy += 2) {
+          const ny = Math.min(h - 1, Math.max(0, ly + dy));
+          for (let dx = -5; dx <= 5; dx += 2) {
+            const nx = Math.min(w - 1, Math.max(0, lx + dx));
+            const nIdx = ny * w + nx;
+            if (lumas[nIdx] >= 238 && chromas[nIdx] <= 28) {
+              nearWhite = true;
+              break;
+            }
+          }
+        }
+        if (nearWhite) coupledStrokePairs++;
+      }
+    }
+  }
+
+  const comps = extractBinaryComponents(inkMask, w, h, 8).filter(
+    (c) => !(c.touchesBorderEdges >= 2 && (c.gw >= w * 0.84 || c.gh >= h * 0.84))
+  );
+
+  const hasStrokedGlyphs =
+    coupledStrokePairs >= 10 && comps.length >= 2 && contrastSpan >= 115;
+
+  return {
+    hasStrokedGlyphs,
+    interiorGlyphComps: comps.length,
+    inkFraction: inkPx / Math.max(1, w * h),
+    contrastSpan,
+    minLuma,
+    maxLuma,
+  };
+}
+
+/**
  * Master False-Positive Protection Gate for Manhwa/Manga Cleaning.
  * Prevents erasing character faces, non-translatable symbols (X, ✓, ⭕),
  * decorative ornaments/weapons, UI progress bars, and architectural lattices
@@ -1032,14 +1139,12 @@ export function evaluateNonTextGuard(input: NonTextGuardInput): NonTextGuardDeci
     imgHeight,
     bbox,
     confidence,
+    insideBubble,
     surroundStats,
     ctdMetrics,
   } = input;
 
-  // 1. Neural Text Consensus Gate:
-  // When Comic-Text-Detector (CTD) sees virtually zero text pixels inside a non-white-bubble
-  // detection (chibi face, sword hilt, decorative cloud, ornate lace, window frame, iron fence),
-  // reject the RT-DETR artwork false positive.
+  // 1. Neural Text Consensus Gate (when CTD metrics are present):
   if (ctdMetrics && !surroundStats.isWhiteBubble) {
     const isNearlyZeroCtd = ctdMetrics.ctd120 < 25 && ctdMetrics.ctdCov65 < 0.01;
     const isWeakLowConfCtd =
@@ -1053,8 +1158,63 @@ export function evaluateNonTextGuard(input: NonTextGuardInput): NonTextGuardDeci
     }
   }
 
+  const nativeGlyph = analyzeNativeGlyphConsensus(rgba, imgWidth, imgHeight, bbox);
+
+  // 1b. Native-Resolution Non-Text Consensus Gate (protects empty dashed panels, uniform silver
+  // embroidery leaves, cat eyes, mouths, breath puffs, and bokeh dots even without CTD!):
+  if (!insideBubble && !surroundStats.isWhiteBubble) {
+    // Giant empty / faint dashed panel box (e.g. 720x800 white panel with dashed curve)
+    if (bbox.w * bbox.h >= 36000 && nativeGlyph.inkFraction < 0.018 && confidence < 0.78) {
+      return {
+        reject: true,
+        reason: 'NO_TEXT_CONSENSUS',
+        detail: `large nearly-empty panel false positive (inkFrac=${nativeGlyph.inkFraction.toFixed(4)})`,
+      };
+    }
+    // Low-contrast grey/pastel embroidery or lace with zero crisp dark or bright text strokes
+    if (
+      confidence < 0.56 &&
+      nativeGlyph.contrastSpan < 105 &&
+      nativeGlyph.minLuma > 108 &&
+      nativeGlyph.maxLuma < 248 &&
+      (!ctdMetrics || ctdMetrics.ctd120 < 180)
+    ) {
+      return {
+        reject: true,
+        reason: 'NO_TEXT_CONSENSUS',
+        detail: `low-contrast decorative/embroidery pattern (span=${nativeGlyph.contrastSpan.toFixed(0)}, minL=${nativeGlyph.minLuma.toFixed(0)})`,
+      };
+    }
+    // Tiny isolated single-blob artwork mark or single animal/character eye (e.g. cat pupil+iris on 002.jpg,
+    // breath puff 'ㅡ', bokeh dot, mouth)
+    if (
+      confidence < 0.62 &&
+      !nativeGlyph.hasStrokedGlyphs &&
+      ((nativeGlyph.interiorGlyphComps <= 1 &&
+        (bbox.w * bbox.h <= 4200 || nativeGlyph.inkFraction < 0.035)) ||
+        (bbox.w <= 72 &&
+          bbox.h <= 72 &&
+          bbox.w / Math.max(1, bbox.h) >= 0.55 &&
+          bbox.w / Math.max(1, bbox.h) <= 1.8 &&
+          nativeGlyph.interiorGlyphComps <= 2 &&
+          confidence < 0.52)) &&
+      (!ctdMetrics || ctdMetrics.ctd120 < 110)
+    ) {
+      return {
+        reject: true,
+        reason: 'NO_TEXT_CONSENSUS',
+        detail: `isolated single-blob artwork/eye mark (comps=${nativeGlyph.interiorGlyphComps}, area=${bbox.w * bbox.h})`,
+      };
+    }
+  } else if (bbox.w * bbox.h >= 85000 && nativeGlyph.inkFraction < 0.012) {
+    return {
+      reject: true,
+      reason: 'NO_TEXT_CONSENSUS',
+      detail: `giant empty bubble/panel box (inkFrac=${nativeGlyph.inkFraction.toFixed(4)})`,
+    };
+  }
+
   // 2. Standalone Non-Translatable Symbol Guard (X / ✕ / ❌, ✓ / ✔, ⭕ / ○):
-  // Runs both inside and outside bubbles so an `❌` or `✓` inside a speech bubble is NEVER erased!
   const symbolHit = detectXOrCheckmarkOrCircleSymbol(rgba, imgWidth, imgHeight, bbox, confidence);
   if (symbolHit.matched) {
     return {
@@ -1064,22 +1224,24 @@ export function evaluateNonTextGuard(input: NonTextGuardInput): NonTextGuardDeci
     };
   }
 
-  // 3. Character Face & Portrait Guard (realistic skin-tone faces + white/chibi faces):
-  const faceHit = detectCharacterFaceRegion(
-    rgba,
-    imgWidth,
-    imgHeight,
-    bbox,
-    surroundStats,
-    confidence,
-    ctdMetrics
-  );
-  if (faceHit.matched) {
-    return {
-      reject: true,
-      reason: 'CHARACTER_FACE',
-      detail: faceHit.detail,
-    };
+  // 3. Character Face & Portrait Guard (skip when strong multi-glyph stroked OT is clearly present):
+  if (!nativeGlyph.hasStrokedGlyphs || nativeGlyph.interiorGlyphComps < 3) {
+    const faceHit = detectCharacterFaceRegion(
+      rgba,
+      imgWidth,
+      imgHeight,
+      bbox,
+      surroundStats,
+      confidence,
+      ctdMetrics
+    );
+    if (faceHit.matched) {
+      return {
+        reject: true,
+        reason: 'CHARACTER_FACE',
+        detail: faceHit.detail,
+      };
+    }
   }
 
   // 4. Non-Text UI / Architectural Pattern Guard (progress bars, window grilles, lattices, stitch seams):

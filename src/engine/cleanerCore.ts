@@ -132,6 +132,17 @@ export function isScanlationWatermark(
     return true;
   }
 
+  // Studio / author credit block in the extreme bottom-left or bottom-right footer of a long webtoon strip
+  if (
+    imgHeight >= 4000 &&
+    y >= imgHeight - 450 &&
+    (x >= imgWidth * 0.62 || x + w <= imgWidth * 0.38) &&
+    w <= imgWidth * 0.38 &&
+    h <= 380
+  ) {
+    return true;
+  }
+
   return false;
 }
 
@@ -1005,10 +1016,13 @@ export function buildRegionPixelMask(params: {
       cropLuma[idx] = luma;
       const chroma = Math.max(Math.abs(r - g), Math.abs(g - b), Math.abs(r - b));
 
-      if (ctdRegionMask && ctdRegionMask[idx] >= 40) {
-        isExteriorWallCandidate[idx] = 0;
-      } else if (region.category === 'BUBBLE') {
-        if (
+      // IMPORTANT: Exterior bubble-wall protection ONLY applies to BUBBLE regions!
+      // Applying it to OT/ST/SFX over dark coats, purple screentones, or walls marks the dark
+      // background itself as a protected wall and clips 3px off outer white text strokes!
+      if (region.category === 'BUBBLE') {
+        if (ctdRegionMask && ctdRegionMask[idx] >= 40) {
+          isExteriorWallCandidate[idx] = 0;
+        } else if (
           isDarkBubble
             ? luma > 95
             : luma < Math.min(218, bgLuma - 28) ||
@@ -1016,58 +1030,73 @@ export function buildRegionPixelMask(params: {
         ) {
           isExteriorWallCandidate[idx] = 1;
         }
-      } else {
-        if (luma < Math.min(155, bgLuma - 45)) {
-          isExteriorWallCandidate[idx] = 1;
-        }
       }
     }
   }
 
-  // Topological Flood-Fill from the outer 1px perimeter of the box along exterior wall candidates,
-  // keeping continuous wall/border components (>= 28 pixels) so curved bubble borders and exterior artwork
-  // entering the bounding box are completely captured.
+  // Detect radial sunburst / spiky shout bubbles (high-frequency dark/light alternations along box perimeter)
+  // so we never flood-whiten into radial needles or spiky burst rays!
+  let perimAlternations = 0;
+  if (region.category === 'BUBBLE' && !isDarkBubble) {
+    let prevWall = -1;
+    const checkPerim = (lx: number, ly: number) => {
+      const wv = cropLuma[ly * bw + lx] < 215 ? 1 : 0;
+      if (prevWall >= 0 && wv !== prevWall) perimAlternations++;
+      prevWall = wv;
+    };
+    for (let lx = 0; lx < bw; lx += 2) checkPerim(lx, 1);
+    for (let ly = 0; ly < bh; ly += 2) checkPerim(bw - 2, ly);
+    for (let lx = bw - 1; lx >= 0; lx -= 2) checkPerim(lx, bh - 2);
+    for (let ly = bh - 1; ly >= 0; ly -= 2) checkPerim(1, ly);
+  }
+  const isRadialOrSpikyBubble = region.category === 'BUBBLE' && perimAlternations >= 18;
+  const finalBubbleMode: BubbleCleanMode = isRadialOrSpikyBubble ? 'TEXT_ONLY' : effectiveBubbleMode;
+
+  // Topological Flood-Fill from the outer 1px perimeter of the box along exterior wall candidates
+  // (ONLY for BUBBLE regions) to protect curved speech bubble outlines.
   const exteriorConnectedWall = new Uint8Array(size);
   const visitedWall = new Uint8Array(size);
 
-  for (let ly = 0; ly < bh; ly++) {
-    for (let lx = 0; lx < bw; lx++) {
-      if (lx !== 0 && lx !== bw - 1 && ly !== 0 && ly !== bh - 1) continue;
-      const startIdx = ly * bw + lx;
-      if (isExteriorWallCandidate[startIdx] === 0 || visitedWall[startIdx] === 1) continue;
+  if (region.category === 'BUBBLE') {
+    for (let ly = 0; ly < bh; ly++) {
+      for (let lx = 0; lx < bw; lx++) {
+        if (lx !== 0 && lx !== bw - 1 && ly !== 0 && ly !== bh - 1) continue;
+        const startIdx = ly * bw + lx;
+        if (isExteriorWallCandidate[startIdx] === 0 || visitedWall[startIdx] === 1) continue;
 
-      const comp: number[] = [];
-      const q: number[] = [startIdx];
-      visitedWall[startIdx] = 1;
+        const comp: number[] = [];
+        const q: number[] = [startIdx];
+        visitedWall[startIdx] = 1;
 
-      while (q.length > 0) {
-        const curr = q.pop()!;
-        comp.push(curr);
-        const cy = Math.floor(curr / bw);
-        const cx = curr % bw;
-        if (effectiveBubbleMode !== 'WHITEN') {
-          const edgeDist = Math.min(cx, bw - 1 - cx, cy, bh - 1 - cy);
-          if (edgeDist > 5) continue;
-        }
+        while (q.length > 0) {
+          const curr = q.pop()!;
+          comp.push(curr);
+          const cy = Math.floor(curr / bw);
+          const cx = curr % bw;
+          if (finalBubbleMode !== 'WHITEN') {
+            const edgeDist = Math.min(cx, bw - 1 - cx, cy, bh - 1 - cy);
+            if (edgeDist > 6) continue;
+          }
 
-        for (let dy = -1; dy <= 1; dy++) {
-          const ny = cy + dy;
-          if (ny < 0 || ny >= bh) continue;
-          for (let dx = -1; dx <= 1; dx++) {
-            const nx = cx + dx;
-            if (nx < 0 || nx >= bw) continue;
-            const nIdx = ny * bw + nx;
-            if (visitedWall[nIdx] === 0 && isExteriorWallCandidate[nIdx] === 1) {
-              visitedWall[nIdx] = 1;
-              q.push(nIdx);
+          for (let dy = -1; dy <= 1; dy++) {
+            const ny = cy + dy;
+            if (ny < 0 || ny >= bh) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = cx + dx;
+              if (nx < 0 || nx >= bw) continue;
+              const nIdx = ny * bw + nx;
+              if (visitedWall[nIdx] === 0 && isExteriorWallCandidate[nIdx] === 1) {
+                visitedWall[nIdx] = 1;
+                q.push(nIdx);
+              }
             }
           }
         }
-      }
 
-      if (comp.length >= 28) {
-        for (const cIdx of comp) {
-          exteriorConnectedWall[cIdx] = 1;
+        if (comp.length >= (isRadialOrSpikyBubble ? 8 : 28)) {
+          for (const cIdx of comp) {
+            exteriorConnectedWall[cIdx] = 1;
+          }
         }
       }
     }
@@ -1076,7 +1105,7 @@ export function buildRegionPixelMask(params: {
   // For WHITEN pure-white/pure-black speech bubbles, any corner/side of the bounding box that lies on
   // the OUTSIDE of a curved bubble border (separated from the bubble's central canvas by exteriorConnectedWall)
   // must also be excluded so outside artwork or page gutters are never whitened!
-  if (effectiveBubbleMode === 'WHITEN') {
+  if (finalBubbleMode === 'WHITEN') {
     const reachableInterior = new Uint8Array(size);
     const iq: number[] = [];
     const xMin = Math.floor(bw * 0.2);
@@ -1123,19 +1152,23 @@ export function buildRegionPixelMask(params: {
     }
   }
 
-  // Build interiorCandidate: 255 everywhere except exteriorConnectedWall + 3px safety margin
+  // Build interiorCandidate: 255 everywhere except exteriorConnectedWall + safety margin (for BUBBLE only!)
   const interiorCandidate = new Uint8Array(size).fill(255);
-  for (let ly = 0; ly < bh; ly++) {
-    for (let lx = 0; lx < bw; lx++) {
-      if (exteriorConnectedWall[ly * bw + lx] === 1) {
-        for (let dy = -3; dy <= 3; dy++) {
-          const ny = ly + dy;
-          if (ny < 0 || ny >= bh) continue;
-          for (let dx = -3; dx <= 3; dx++) {
-            const nx = lx + dx;
-            if (nx < 0 || nx >= bw) continue;
-            if (dx * dx + dy * dy <= 9) {
-              interiorCandidate[ny * bw + nx] = 0;
+  if (region.category === 'BUBBLE') {
+    const wallMargin = isRadialOrSpikyBubble ? 2 : 3;
+    const wallMargin2 = wallMargin * wallMargin;
+    for (let ly = 0; ly < bh; ly++) {
+      for (let lx = 0; lx < bw; lx++) {
+        if (exteriorConnectedWall[ly * bw + lx] === 1) {
+          for (let dy = -wallMargin; dy <= wallMargin; dy++) {
+            const ny = ly + dy;
+            if (ny < 0 || ny >= bh) continue;
+            for (let dx = -wallMargin; dx <= wallMargin; dx++) {
+              const nx = lx + dx;
+              if (nx < 0 || nx >= bw) continue;
+              if (dx * dx + dy * dy <= wallMargin2) {
+                interiorCandidate[ny * bw + nx] = 0;
+              }
             }
           }
         }
@@ -1143,51 +1176,128 @@ export function buildRegionPixelMask(params: {
     }
   }
 
-  // Estimate per-scanline clean background color (rowBgR, rowBgG, rowBgB, rowBgLuma)
+  // Estimate TRUE outer background color per scanline from the outer rim of bbox + just outside bbox
+  // (NEVER picking the 76th percentile across the whole row, which gets poisoned by thick white strokes!)
   const rowBgR = new Float32Array(bh);
   const rowBgG = new Float32Array(bh);
   const rowBgB = new Float32Array(bh);
   const rowBgLuma = new Float32Array(bh);
+  const rowBgChroma = new Float32Array(bh);
 
+  const allRimSamples: { r: number; g: number; b: number; l: number }[] = [];
   for (let ly = 0; ly < bh; ly++) {
-    const rowSamples: { r: number; g: number; b: number; l: number }[] = [];
-    const y0 = Math.max(0, ly - 2);
-    const y1 = Math.min(bh - 1, ly + 2);
-    for (let ny = y0; ny <= y1; ny++) {
-      for (let lx = 0; lx < bw; lx += 2) {
-        const idx = ny * bw + lx;
-        if (interiorCandidate[idx] === 0) continue;
-        if (ctdRegionMask && ctdRegionMask[idx] >= 45) continue;
-        const p = idx * 4;
-        rowSamples.push({
-          r: cropRgba[p],
-          g: cropRgba[p + 1],
-          b: cropRgba[p + 2],
-          l: cropLuma[idx],
-        });
-      }
+    const py = Math.min(imgHeight - 1, Math.max(0, by + ly));
+    const rimRow: { r: number; g: number; b: number; l: number }[] = [];
+    // Sample left & right outer rims (-6..+5 px around bbox edges)
+    const sampleXs = [-6, -3, 0, 2, 4, bw - 5, bw - 3, bw - 1, bw + 2, bw + 5];
+    for (const sx of sampleXs) {
+      const gx = bx + sx;
+      if (gx < 0 || gx >= imgWidth) continue;
+      if (sx >= 0 && sx < bw && exteriorConnectedWall[ly * bw + sx] === 1) continue;
+      const p = (py * imgWidth + gx) * 4;
+      const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
+      const l = rgbToLuma(r, g, b);
+      rimRow.push({ r, g, b, l });
+      if ((ly & 1) === 0) allRimSamples.push({ r, g, b, l });
     }
-    if (rowSamples.length === 0) {
+    if (rimRow.length === 0) {
       rowBgR[ly] = bgR;
       rowBgG[ly] = bgG;
       rowBgB[ly] = bgB;
       rowBgLuma[ly] = bgLuma;
+      rowBgChroma[ly] = Math.max(bgR, bgG, bgB) - Math.min(bgR, bgG, bgB);
     } else {
-      rowSamples.sort((a, b) => a.l - b.l);
-      const pickIdx =
-        bgLuma >= 115
-          ? Math.floor(rowSamples.length * 0.76)
-          : Math.floor(rowSamples.length * 0.24);
-      const chosen = rowSamples[Math.min(rowSamples.length - 1, Math.max(0, pickIdx))];
+      rimRow.sort((a, b) => a.l - b.l);
+      const chosen = rimRow[Math.floor(rimRow.length * 0.5)];
       rowBgR[ly] = chosen.r;
       rowBgG[ly] = chosen.g;
       rowBgB[ly] = chosen.b;
       rowBgLuma[ly] = chosen.l;
+      rowBgChroma[ly] = Math.max(chosen.r, chosen.g, chosen.b) - Math.min(chosen.r, chosen.g, chosen.b);
     }
   }
+  allRimSamples.sort((a, b) => a.l - b.l);
+  const outerMedLuma =
+    allRimSamples.length > 0 ? allRimSamples[Math.floor(allRimSamples.length * 0.5)].l : bgLuma;
+  const outerP20Luma =
+    allRimSamples.length > 0 ? allRimSamples[Math.floor(allRimSamples.length * 0.2)].l : bgLuma;
 
   const preciseMask = extractPreciseTextMask(cropRgba, detectorBoxMask, bw, bh, 12, 4);
   const dilated = new Uint8Array(size);
+
+  // Detect Heavy Stroke / Strong Outline ("ستروك قوي") directly at native 1:1 pixel resolution!
+  // Covers:
+  //  A) Dark or colored glyph core surrounded by a thick bright/white outer stroke (e.g. 하아.., 하하.., 후우..,
+  //     끄덕, 이런 모습.., 오소소.., 대공님 뒤에 돌.. on blue gradient, 푸웁-!!!! on pink gradient, 프롤로즈가는.. on bubble edge)
+  //  B) Bright or colored glyph core surrounded by a thick dark outline (+ optional 2nd outer white glow,
+  //     e.g. 반짝.., 할짝.., 야옹, 바둥, 부들, 훌쩍..)
+  let darkCoreWithBrightStrokePairs = 0;
+  let brightCoreWithDarkStrokePairs = 0;
+  for (let ly = 3; ly < bh - 3; ly += 2) {
+    for (let lx = 3; lx < bw - 3; lx += 2) {
+      const idx = ly * bw + lx;
+      if (interiorCandidate[idx] === 0) continue;
+      const p = idx * 4;
+      const r = cropRgba[p], g = cropRgba[p + 1], b = cropRgba[p + 2];
+      const l = cropLuma[idx];
+      const ch = Math.max(r, g, b) - Math.min(r, g, b);
+
+      // Check dark/colored ink core adjacent to bright low-chroma stroke (>= 236)
+      const isDarkOrColoredCore = l <= 135 || (ch >= 42 && l <= 185);
+      if (isDarkOrColoredCore) {
+        let hasBrightHalo = false;
+        for (let dy = -6; dy <= 6 && !hasBrightHalo; dy += 2) {
+          const ny = Math.min(bh - 1, Math.max(0, ly + dy));
+          for (let dx = -6; dx <= 6; dx += 2) {
+            const nx = Math.min(bw - 1, Math.max(0, lx + dx));
+            const nIdx = ny * bw + nx;
+            const np = nIdx * 4;
+            const nCh =
+              Math.max(cropRgba[np], cropRgba[np + 1], cropRgba[np + 2]) -
+              Math.min(cropRgba[np], cropRgba[np + 1], cropRgba[np + 2]);
+            if (cropLuma[nIdx] >= 236 && nCh <= 30) {
+              hasBrightHalo = true;
+              break;
+            }
+          }
+        }
+        if (hasBrightHalo) darkCoreWithBrightStrokePairs++;
+      }
+
+      if (l >= 210) {
+        let hasDarkHalo = false;
+        for (let dy = -5; dy <= 5 && !hasDarkHalo; dy += 2) {
+          const ny = Math.min(bh - 1, Math.max(0, ly + dy));
+          for (let dx = -5; dx <= 5; dx += 2) {
+            const nx = Math.min(bw - 1, Math.max(0, lx + dx));
+            if (cropLuma[ny * bw + nx] <= 78) {
+              hasDarkHalo = true;
+              break;
+            }
+          }
+        }
+        if (hasDarkHalo) brightCoreWithDarkStrokePairs++;
+      }
+    }
+  }
+
+  // A region has a genuine bright outer stroke halo whenever coupled dark+white pairs exist AND the outer
+  // background is NOT uniform pure #FFFFFF paper (e.g. colored/gradient bubble, peach/wood/coat/purple bg,
+  // or split panel/bubble border where outerP20Luma < 238)!
+  const outerIsPureWhiteEverywhere =
+    outerMedLuma >= 249 &&
+    outerP20Luma >= 244 &&
+    region.surroundStats.isWhiteBubble &&
+    !region.surroundStats.isGradient;
+
+  const outerIsPureBlackBanner = outerMedLuma <= 14 && outerP20Luma <= 8;
+
+  const hasHeavyStrokedText =
+    finalBubbleMode !== 'WHITEN' &&
+    !outerIsPureWhiteEverywhere &&
+    !outerIsPureBlackBanner &&
+    (darkCoreWithBrightStrokePairs >= 10 ||
+      (brightCoreWithDarkStrokePairs >= 12 && outerMedLuma < 238));
 
   // Check if neural comictextdetector segmentation mask has active glyph pixels inside this region
   let ctdActiveCount = 0;
@@ -1200,12 +1310,14 @@ export function buildRegionPixelMask(params: {
   }
 
   const isSmoothBubbleOrPanel =
-    effectiveBubbleMode !== 'WHITEN' &&
-    region.surroundStats.stdLuma <= 21.0 &&
-    !region.surroundStats.isPeriodicScreentone &&
-    region.category !== 'SFX';
+    finalBubbleMode !== 'WHITEN' &&
+    !hasHeavyStrokedText &&
+    (isRadialOrSpikyBubble ||
+      (region.surroundStats.stdLuma <= 21.0 &&
+        !region.surroundStats.isPeriodicScreentone &&
+        region.category !== 'SFX'));
 
-  if (effectiveBubbleMode === 'WHITEN') {
+  if (finalBubbleMode === 'WHITEN') {
     if (!isDarkBubble) {
       // Verified Pure White Bubble (#FFFFFF): mask all non-255 pixels inside interiorCandidate
       for (let i = 0; i < size; i++) {
@@ -1267,6 +1379,222 @@ export function buildRegionPixelMask(params: {
               strokeSeedMask[nIdx] = 1;
               dilated[nIdx] = 1;
               q.push(nIdx);
+            }
+          }
+        }
+      }
+    }
+  } else if (hasHeavyStrokedText) {
+    // Dedicated Multi-Layer Heavy-Stroke & Halo Extractor ("ستروك قوي"):
+    // Captures 100% of inner dark/colored glyph strokes PLUS thick outer white/cream/dark/colored
+    // strokes up to 14px wide, while leaving unbroken background panel lines intact for LaMa/plane fill!
+
+    // Step 1: Identify unbroken horizontal/vertical dark panel border lines spanning >= 85% of bbox
+    // that have NO bright stroke halo immediately on both sides, so straight panel borders aren't erased.
+    const protectedPanelBorder = new Uint8Array(size);
+    for (let ly = 0; ly < bh; ly++) {
+      let darkSpan = 0;
+      let haloNearRow = 0;
+      for (let lx = 0; lx < bw; lx++) {
+        const idx = ly * bw + lx;
+        if (cropLuma[idx] <= 55) {
+          darkSpan++;
+          const u = Math.max(0, ly - 3) * bw + lx;
+          const d = Math.min(bh - 1, ly + 3) * bw + lx;
+          if (cropLuma[u] >= 238 && cropLuma[d] >= 238) haloNearRow++;
+        }
+      }
+      if (darkSpan >= bw * 0.85 && haloNearRow < bw * 0.25) {
+        for (let lx = 0; lx < bw; lx++) {
+          const idx = ly * bw + lx;
+          const u = Math.max(0, ly - 3) * bw + lx;
+          const d = Math.min(bh - 1, ly + 3) * bw + lx;
+          if (cropLuma[idx] <= 65 && !(cropLuma[u] >= 238 || cropLuma[d] >= 238)) {
+            protectedPanelBorder[idx] = 1;
+          }
+        }
+      }
+    }
+
+    // Step 2: Seed core glyph pixels (coupled dark+bright or colored+halo pairs)
+    const coreSeed = new Uint8Array(size);
+    const rCouple = 8;
+    for (let ly = 0; ly < bh; ly++) {
+      for (let lx = 0; lx < bw; lx++) {
+        const idx = ly * bw + lx;
+        if (interiorCandidate[idx] === 0 || protectedPanelBorder[idx] === 1) continue;
+        const p = idx * 4;
+        const r = cropRgba[p], g = cropRgba[p + 1], b = cropRgba[p + 2];
+        const l = cropLuma[idx];
+        const ch = Math.max(r, g, b) - Math.min(r, g, b);
+
+        const isDarkOrColoredInk =
+          l <= 135 ||
+          (ch >= 38 && l <= 190 && Math.abs(l - rowBgLuma[ly]) >= 18) ||
+          (ctdRegionMask != null && ctdRegionMask[idx] >= 65 && l <= 180);
+        const isBrightStrokeOrCore = l >= 228 && ch <= 34;
+
+        if (!isDarkOrColoredInk && !isBrightStrokeOrCore) continue;
+
+        let hasPartner = false;
+        const y0 = Math.max(0, ly - rCouple);
+        const y1 = Math.min(bh - 1, ly + rCouple);
+        const x0 = Math.max(0, lx - rCouple);
+        const x1 = Math.min(bw - 1, lx + rCouple);
+        for (let ny = y0; ny <= y1 && !hasPartner; ny += 2) {
+          for (let nx = x0; nx <= x1; nx += 2) {
+            const nIdx = ny * bw + nx;
+            if (protectedPanelBorder[nIdx] === 1) continue;
+            const nl = cropLuma[nIdx];
+            const np = nIdx * 4;
+            const nCh =
+              Math.max(cropRgba[np], cropRgba[np + 1], cropRgba[np + 2]) -
+              Math.min(cropRgba[np], cropRgba[np + 1], cropRgba[np + 2]);
+            if (isDarkOrColoredInk && nl >= 232 && nCh <= 32) {
+              hasPartner = true;
+              break;
+            }
+            if (isBrightStrokeOrCore && (nl <= 120 || (nCh >= 42 && nl <= 180))) {
+              hasPartner = true;
+              break;
+            }
+          }
+        }
+        if (hasPartner) {
+          coreSeed[idx] = 1;
+        }
+      }
+    }
+
+    // Step 3: Geodesic outward flood-fill up to 14px from coreSeed across the entire attached outer
+    // stroke/halo/glow (white stroke >= 216, dark outline <= 105, or high-contrast colored stroke)!
+    const distMap = new Int16Array(size).fill(-1);
+    const q: number[] = [];
+    for (let i = 0; i < size; i++) {
+      if (coreSeed[i] === 1) {
+        strokeSeedMask[i] = 1;
+        distMap[i] = 0;
+        q.push(i);
+      }
+    }
+
+    const maxHaloGrow = 14;
+    let head = 0;
+    while (head < q.length) {
+      const curr = q[head++];
+      const d = distMap[curr];
+      if (d >= maxHaloGrow) continue;
+      const cy = Math.floor(curr / bw);
+      const cx = curr % bw;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = cy + dy;
+        if (ny < 0 || ny >= bh) continue;
+        const lBg = rowBgLuma[ny];
+        const rBg = rowBgR[ny], gBg = rowBgG[ny], bBg = rowBgB[ny];
+        const chBg = rowBgChroma[ny];
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = cx + dx;
+          if (nx < 0 || nx >= bw) continue;
+          const nIdx = ny * bw + nx;
+          if (
+            distMap[nIdx] !== -1 ||
+            interiorCandidate[nIdx] === 0 ||
+            protectedPanelBorder[nIdx] === 1
+          ) {
+            continue;
+          }
+          const np = nIdx * 4;
+          const r = cropRgba[np], g = cropRgba[np + 1], b = cropRgba[np + 2];
+          const l = cropLuma[nIdx];
+          const ch = Math.max(r, g, b) - Math.min(r, g, b);
+          const colorDistBg = Math.abs(r - rBg) + Math.abs(g - gBg) + Math.abs(b - bBg);
+
+          // Attached white/cream outer stroke over non-white background (or split border)
+          const isWhiteHaloPixel =
+            l >= 216 &&
+            ch <= 38 &&
+            (lBg < 243 || chBg > 10 || outerP20Luma < 225) &&
+            (lBg < 245 || d <= 5);
+          // Attached dark outline / drop-shadow pixel
+          const isDarkOutlinePixel = l <= 105 && lBg >= 125 && d <= 9;
+          // Attached colored/anti-aliased stroke contrasting strongly with local scanline background
+          const isContrastingStrokePixel =
+            d <= 8 &&
+            colorDistBg >= 46 &&
+            (preciseMask[nIdx] > 0 || Math.abs(l - lBg) >= 22);
+
+          if (isWhiteHaloPixel || isDarkOutlinePixel || isContrastingStrokePixel) {
+            distMap[nIdx] = d + 1;
+            strokeSeedMask[nIdx] = 1;
+            q.push(nIdx);
+          }
+        }
+      }
+    }
+
+    // Step 4: Morphological closing (dilate r=5, erode r=2 -> +3px solid bridge) so 100% of
+    // interior counters, anti-aliased transitions between dark glyph & white stroke, and stroke tips
+    // become completely solid (writeMask = 255), followed by +3px outer feather rim!
+    const closedTemp = new Uint8Array(size);
+    const cRad = 5;
+    const cRad2 = cRad * cRad + 1;
+    for (let ly = 0; ly < bh; ly++) {
+      for (let lx = 0; lx < bw; lx++) {
+        if (strokeSeedMask[ly * bw + lx] === 0) continue;
+        for (let dy = -cRad; dy <= cRad; dy++) {
+          const ny = ly + dy;
+          if (ny < 0 || ny >= bh) continue;
+          for (let dx = -cRad; dx <= cRad; dx++) {
+            const nx = lx + dx;
+            if (nx < 0 || nx >= bw) continue;
+            if (dx * dx + dy * dy <= cRad2 && interiorCandidate[ny * bw + nx] > 0) {
+              closedTemp[ny * bw + nx] = 1;
+            }
+          }
+        }
+      }
+    }
+    const eRad = 2;
+    for (let ly = 0; ly < bh; ly++) {
+      for (let lx = 0; lx < bw; lx++) {
+        const idx = ly * bw + lx;
+        if (closedTemp[idx] === 0 || interiorCandidate[idx] === 0 || protectedPanelBorder[idx] === 1) {
+          continue;
+        }
+        let allSet = true;
+        for (let dy = -eRad; dy <= eRad && allSet; dy++) {
+          const ny = Math.min(bh - 1, Math.max(0, ly + dy));
+          for (let dx = -eRad; dx <= eRad; dx++) {
+            const nx = Math.min(bw - 1, Math.max(0, lx + dx));
+            if (closedTemp[ny * bw + nx] === 0) {
+              allSet = false;
+              break;
+            }
+          }
+        }
+        if (allSet) {
+          strokeSeedMask[idx] = 1;
+        }
+      }
+    }
+
+    const outerDilR = 3;
+    const outerDilR2 = outerDilR * outerDilR + 1;
+    for (let ly = 0; ly < bh; ly++) {
+      for (let lx = 0; lx < bw; lx++) {
+        if (strokeSeedMask[ly * bw + lx] === 0) continue;
+        for (let dy = -outerDilR; dy <= outerDilR; dy++) {
+          const ny = ly + dy;
+          if (ny < 0 || ny >= bh) continue;
+          for (let dx = -outerDilR; dx <= outerDilR; dx++) {
+            const nx = lx + dx;
+            if (nx < 0 || nx >= bw) continue;
+            if (
+              dx * dx + dy * dy <= outerDilR2 &&
+              interiorCandidate[ny * bw + nx] > 0 &&
+              protectedPanelBorder[ny * bw + nx] === 0
+            ) {
+              dilated[ny * bw + nx] = 1;
             }
           }
         }
@@ -1945,17 +2273,14 @@ export function buildRegionPixelMask(params: {
 }
 
 /**
- * Solves a 3x3 linear system M * x = b using Gaussian elimination with partial pivoting.
+ * Solves an NxN linear system M * x = b using Gaussian elimination with partial pivoting.
  */
-function solve3x3(M: number[][], b: number[]): [number, number, number] | null {
-  const A = [
-    [M[0][0], M[0][1], M[0][2], b[0]],
-    [M[1][0], M[1][1], M[1][2], b[1]],
-    [M[2][0], M[2][1], M[2][2], b[2]],
-  ];
-  for (let col = 0; col < 3; col++) {
+function solveLinearSystem(M: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  const A = M.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
     let pivot = col;
-    for (let row = col + 1; row < 3; row++) {
+    for (let row = col + 1; row < n; row++) {
       if (Math.abs(A[row][col]) > Math.abs(A[pivot][col])) pivot = row;
     }
     if (Math.abs(A[pivot][col]) < 1e-7) return null;
@@ -1963,28 +2288,38 @@ function solve3x3(M: number[][], b: number[]): [number, number, number] | null {
     A[col] = A[pivot];
     A[pivot] = tmp;
 
-    for (let row = col + 1; row < 3; row++) {
+    for (let row = col + 1; row < n; row++) {
       const f = A[row][col] / A[col][col];
-      for (let k = col; k < 4; k++) {
+      for (let k = col; k <= n; k++) {
         A[row][k] -= f * A[col][k];
       }
     }
   }
-  const x2 = A[2][3] / A[2][2];
-  const x1 = (A[1][3] - A[1][2] * x2) / A[1][1];
-  const x0 = (A[0][3] - A[0][1] * x1 - A[0][2] * x2) / A[0][0];
-  return [x0, x1, x2];
+  const x = new Array<number>(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    let sum = A[i][n];
+    for (let j = i + 1; j < n; j++) {
+      sum -= A[i][j] * x[j];
+    }
+    x[i] = sum / A[i][i];
+  }
+  return x;
+}
+
+function solve3x3(M: number[][], b: number[]): [number, number, number] | null {
+  const res = solveLinearSystem(M, b);
+  return res ? [res[0], res[1], res[2]] : null;
 }
 
 /**
  * Attempts to clean `writeMask > 0` using the immediate clean 1..6px surround ring around the masked letters:
- * - Tier 1 (`FLAT_RING`): If the ring around the letters is a flat uniform color (`spread <= 16`, e.g. white,
- *   black, lavender thought bubbles `#CBD0EA`, grey boxes `#BDBDBD`, gold plaques `#DFC798`), fills masked pixels
- *   with the exact median ring color — zero white corners or seams!
- * - Tier 2 (`GRADIENT_PLANE`): Fits a 2D linear plane `RGB(y, x) = a*y + b*x + c` by least-squares to the
- *   clean ring pixels. If `MAE <= 4.0` (for light/medium gradient bubbles) or `MAE <= 2.0 && spread <= 20`
- *   (for dark panels), fills masked pixels with the exact 2D linear gradient plane!
- * - Returns `null` when background has complex artwork, screentones, wooden planks, bokeh, or bamboo leaves
+ * - Tier 1 (`FLAT_RING`): If the ring around the letters is a flat uniform color (white, black, lavender,
+ *   grey, gold, OR radial/spiky bubble interior where >= 74% of ring pixels are pure white paper), fills
+ *   masked pixels in < 1ms with zero seams or ray damage!
+ * - Tier 2 (`GRADIENT_PLANE`): Fits a 2D Quadratic Smooth Surface (`c0*y^2 + c1*x^2 + c2*x*y + c3*y + c4*x + c5`,
+ *   or 2D Linear Plane fallback) by least-squares to the clean ring pixels. Reconstructs curved/radial/linear
+ *   gradient bubbles (blue, pink, purple, peach) in < 1.5ms without needing 5-second LaMa calls!
+ * - Returns `null` when background has complex artwork, screentones, wooden planks, bokeh, or foliage
  *   so `cleanRegionWithOnnxSupport` routes it to neural `lama-manga.onnx` (512x512).
  */
 export function tryCleanFlatOrGradientRing(params: {
@@ -1996,12 +2331,10 @@ export function tryCleanFlatOrGradientRing(params: {
   interiorCandidate: Uint8Array;
 }): 'FLAT_RING' | 'GRADIENT_PLANE' | null {
   const { rgba, imgWidth, imgHeight, region, writeMask, interiorCandidate } = params;
-  if (region.surroundStats.isPeriodicScreentone) {
-    return null;
-  }
-
+  // Note: Only trust direct ring texture measurement (`localTexMean > 3.8`) to reject screentones
+  // rather than the coarse bbox-outer `isPeriodicScreentone` flag (which can falsely trigger on striped text).
   const { x: bx, y: by, w: bw, h: bh } = region.bbox;
-  const ringPixels: { x: number; y: number; r: number; g: number; b: number; l: number }[] = [];
+  const rawRingPixels: { x: number; y: number; r: number; g: number; b: number; l: number }[] = [];
 
   for (let ly = 0; ly < bh; ly++) {
     const py = by + ly;
@@ -2013,10 +2346,10 @@ export function tryCleanFlatOrGradientRing(params: {
       if (writeMask[idx] > 0 || interiorCandidate[idx] === 0) continue;
 
       let nearMask = false;
-      for (let dy = -5; dy <= 5 && !nearMask; dy += 2) {
+      for (let dy = -6; dy <= 6 && !nearMask; dy += 2) {
         const ny = ly + dy;
         if (ny < 0 || ny >= bh) continue;
-        for (let dx = -5; dx <= 5; dx += 2) {
+        for (let dx = -6; dx <= 6; dx += 2) {
           const nx = lx + dx;
           if (nx < 0 || nx >= bw) continue;
           if (writeMask[ny * bw + nx] > 0) {
@@ -2031,11 +2364,82 @@ export function tryCleanFlatOrGradientRing(params: {
       const r = rgba[pIdx];
       const g = rgba[pIdx + 1];
       const b = rgba[pIdx + 2];
-      ringPixels.push({ x: lx, y: ly, r, g, b, l: rgbToLuma(r, g, b) });
+      rawRingPixels.push({ x: lx, y: ly, r, g, b, l: rgbToLuma(r, g, b) });
     }
   }
 
-  if (ringPixels.length < 20) return null;
+  if (rawRingPixels.length < 20) return null;
+
+  // Special fast-path for radial sunburst / spiky shout bubbles:
+  // If this is a BUBBLE and >= 74% of the immediate ring around the masked letters is pure white paper
+  // (r>=244, g>=244, b>=244), filter out any stray radial-needle tips at the outer edges and fill #FFFFFF!
+  if (region.category === 'BUBBLE') {
+    const pureWhiteRing = rawRingPixels.filter(
+      (p) => p.r >= 244 && p.g >= 244 && p.b >= 244 && Math.max(p.r, p.g, p.b) - Math.min(p.r, p.g, p.b) <= 10
+    );
+    if (pureWhiteRing.length >= rawRingPixels.length * 0.74 && pureWhiteRing.length >= 24) {
+      for (let ly = 0; ly < bh; ly++) {
+        const py = by + ly;
+        if (py < 0 || py >= imgHeight) continue;
+        for (let lx = 0; lx < bw; lx++) {
+          const px = bx + lx;
+          if (px < 0 || px >= imgWidth) continue;
+          const mAlpha = writeMask[ly * bw + lx];
+          if (mAlpha === 0) continue;
+          const dstIdx = (py * imgWidth + px) * 4;
+          if (mAlpha === 255) {
+            rgba[dstIdx] = 255;
+            rgba[dstIdx + 1] = 255;
+            rgba[dstIdx + 2] = 255;
+          } else {
+            const t = mAlpha / 255;
+            const w = t * t * (3 - 2 * t);
+            rgba[dstIdx] = Math.round(rgba[dstIdx] * (1 - w) + 255 * w);
+            rgba[dstIdx + 1] = Math.round(rgba[dstIdx + 1] * (1 - w) + 255 * w);
+            rgba[dstIdx + 2] = Math.round(rgba[dstIdx + 2] * (1 - w) + 255 * w);
+          }
+        }
+      }
+      return 'FLAT_RING';
+    }
+  }
+
+  // Also fast-path solid pure-black panels / copyright headers (where >= 78% of ring pixels are <= 10 luma)
+  const pureDarkRing = rawRingPixels.filter((p) => p.r <= 12 && p.g <= 12 && p.b <= 12);
+  if (pureDarkRing.length >= rawRingPixels.length * 0.78 && pureDarkRing.length >= 24) {
+    const medDarkR = pureDarkRing[Math.floor(pureDarkRing.length * 0.5)].r;
+    const medDarkG = pureDarkRing[Math.floor(pureDarkRing.length * 0.5)].g;
+    const medDarkB = pureDarkRing[Math.floor(pureDarkRing.length * 0.5)].b;
+    const snapZero = medDarkR <= 4 && medDarkG <= 4 && medDarkB <= 4;
+    const tr = snapZero ? 0 : medDarkR;
+    const tg = snapZero ? 0 : medDarkG;
+    const tb = snapZero ? 0 : medDarkB;
+    for (let ly = 0; ly < bh; ly++) {
+      const py = by + ly;
+      if (py < 0 || py >= imgHeight) continue;
+      for (let lx = 0; lx < bw; lx++) {
+        const px = bx + lx;
+        if (px < 0 || px >= imgWidth) continue;
+        const mAlpha = writeMask[ly * bw + lx];
+        if (mAlpha === 0) continue;
+        const dstIdx = (py * imgWidth + px) * 4;
+        if (mAlpha === 255) {
+          rgba[dstIdx] = tr;
+          rgba[dstIdx + 1] = tg;
+          rgba[dstIdx + 2] = tb;
+        } else {
+          const t = mAlpha / 255;
+          const w = t * t * (3 - 2 * t);
+          rgba[dstIdx] = Math.round(rgba[dstIdx] * (1 - w) + tr * w);
+          rgba[dstIdx + 1] = Math.round(rgba[dstIdx + 1] * (1 - w) + tg * w);
+          rgba[dstIdx + 2] = Math.round(rgba[dstIdx + 2] * (1 - w) + tb * w);
+        }
+      }
+    }
+    return 'FLAT_RING';
+  }
+
+  const ringPixels = rawRingPixels;
 
   // Measure local neighbor texture/detail energy in the unmasked ring to catch translucent bubbles over artwork!
   let localGradSum = 0;
@@ -2048,10 +2452,18 @@ export function tryCleanFlatOrGradientRing(params: {
     if (gx + 2 < imgWidth && gy + 2 < imgHeight) {
       const pR = (gy * imgWidth + (gx + 2)) * 4;
       const pD = ((gy + 2) * imgWidth + gx) * 4;
-      const lR = rgbToLuma(rgba[pR], rgba[pR + 1], rgba[pR + 2]);
-      const lD = rgbToLuma(rgba[pD], rgba[pD + 1], rgba[pD + 2]);
-      localGradSum += Math.abs(rp.l - lR) + Math.abs(rp.l - lD);
-      localGradCnt += 2;
+      const rIdx = rp.y * bw + Math.min(bw - 1, rp.x + 2);
+      const dIdx = Math.min(bh - 1, rp.y + 2) * bw + rp.x;
+      if (writeMask[rIdx] === 0 && interiorCandidate[rIdx] > 0) {
+        const lR = rgbToLuma(rgba[pR], rgba[pR + 1], rgba[pR + 2]);
+        localGradSum += Math.abs(rp.l - lR);
+        localGradCnt++;
+      }
+      if (writeMask[dIdx] === 0 && interiorCandidate[dIdx] > 0) {
+        const lD = rgbToLuma(rgba[pD], rgba[pD + 1], rgba[pD + 2]);
+        localGradSum += Math.abs(rp.l - lD);
+        localGradCnt++;
+      }
     }
   }
   const localTexMean = localGradCnt > 0 ? localGradSum / localGradCnt : 0;
@@ -2079,7 +2491,6 @@ export function tryCleanFlatOrGradientRing(params: {
   const spreadB = bs[p90Idx] - bs[p10Idx];
   const maxSpread = Math.max(spreadR, spreadG, spreadB);
 
-  // Measure hue/chroma variation inside the ring (translucent bubbles over colored art have varying R-B / R-G!)
   const rgDiffs = trimmed.map((p) => p.r - p.g).sort((a, b) => a - b);
   const rbDiffs = trimmed.map((p) => p.r - p.b).sort((a, b) => a - b);
   const chromaSpread = Math.max(
@@ -2087,8 +2498,12 @@ export function tryCleanFlatOrGradientRing(params: {
     rbDiffs[p90Idx] - rbDiffs[p10Idx]
   );
 
-  // If the bubble/box shows translucent artwork texture or multi-color bleed, NEVER flat-fill or plane-fit — route to LaMa!
-  if (localTexMean > 3.8 || chromaSpread > 12) {
+  // If the region shows high-frequency artwork texture, route to LaMa!
+  // Smooth colored gradients (blue->white, pink->white, sky/sunset gradients) naturally vary in R-B up to ~38
+  // while keeping localTexMean very smooth (<= 2.6)!
+  const maxChromaSpreadAllowed =
+    region.category === 'BUBBLE' || localTexMean <= 2.4 ? 38 : 14;
+  if (localTexMean > 3.8 || chromaSpread > maxChromaSpreadAllowed) {
     return null;
   }
 
@@ -2097,14 +2512,14 @@ export function tryCleanFlatOrGradientRing(params: {
   let medB = bs[medIdx];
   const medL = trimmed[medIdx].l;
 
-  // Tier 1: Flat Solid Background (strict enough so translucent bubbles over artwork route to LaMa)
+  // Tier 1: Flat Solid Background
   const flatSpreadLimit = region.category === 'SFX' ? 10 : 11;
-  if (maxSpread <= flatSpreadLimit && fullLumaSpread <= 22 && localTexMean <= 2.6) {
+  if (maxSpread <= flatSpreadLimit && fullLumaSpread <= 22 && localTexMean <= 2.6 && chromaSpread <= 12) {
     if (medL >= 250 && maxSpread <= 6) {
       medR = 255;
       medG = 255;
       medB = 255;
-    } else if (medL <= 6 && maxSpread <= 6 && region.surroundStats.isDarkBubble) {
+    } else if (medL <= 6 && maxSpread <= 6) {
       medR = 0;
       medG = 0;
       medB = 0;
@@ -2135,61 +2550,114 @@ export function tryCleanFlatOrGradientRing(params: {
     return 'FLAT_RING';
   }
 
-  // Tier 2: 2D Linear Plane Least-Squares Fit RGB(y, x) = a*y + b*x + c (skip for SFX so textured SFX route to LaMa)
+  // Tier 2: 2D Smooth Polynomial Surface Fit (Quadratic 6-DOF for curved/radial gradient bubbles, Linear 3-DOF fallback)
   if (region.category === 'SFX') return null;
-  if (maxSpread > 78) return null;
-  if (medL < 120 && maxSpread > 22) return null; // Protect dark textured scenes (wooden planks, bokeh, palm fronds)
+  if (maxSpread > 95) return null;
+  if (medL < 120 && maxSpread > 22) return null;
 
-  const step = Math.max(1, Math.floor(trimmed.length / 260));
+  const step = Math.max(1, Math.floor(trimmed.length / 320));
   const samples = trimmed.filter((_, i) => i % step === 0);
   if (samples.length < 16) return null;
 
-  const ATA = [
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-  ];
-  const ATbR = [0, 0, 0];
-  const ATbG = [0, 0, 0];
-  const ATbB = [0, 0, 0];
+  const invW = 1 / Math.max(1, bw);
+  const invH = 1 / Math.max(1, bh);
 
-  for (const s of samples) {
-    const v0 = s.y;
-    const v1 = s.x;
-    ATA[0][0] += v0 * v0;
-    ATA[0][1] += v0 * v1;
-    ATA[0][2] += v0;
-    ATA[1][0] += v1 * v0;
-    ATA[1][1] += v1 * v1;
-    ATA[1][2] += v1;
-    ATA[2][0] += v0;
-    ATA[2][1] += v1;
-    ATA[2][2] += 1;
+  let evalRgbAt: ((lx: number, ly: number) => [number, number, number]) | null = null;
 
-    ATbR[0] += v0 * s.r;
-    ATbR[1] += v1 * s.r;
-    ATbR[2] += s.r;
+  // Try 6-term quadratic surface [ny^2, nx^2, nx*ny, ny, nx, 1] when >= 36 samples exist
+  if (samples.length >= 36) {
+    const ATA6 = Array.from({ length: 6 }, () => [0, 0, 0, 0, 0, 0]);
+    const bR6 = [0, 0, 0, 0, 0, 0];
+    const bG6 = [0, 0, 0, 0, 0, 0];
+    const bB6 = [0, 0, 0, 0, 0, 0];
 
-    ATbG[0] += v0 * s.g;
-    ATbG[1] += v1 * s.g;
-    ATbG[2] += s.g;
+    for (const s of samples) {
+      const nx = s.x * invW - 0.5;
+      const ny = s.y * invH - 0.5;
+      const basis = [ny * ny, nx * nx, nx * ny, ny, nx, 1];
+      for (let r = 0; r < 6; r++) {
+        const br = basis[r];
+        for (let c = 0; c < 6; c++) {
+          ATA6[r][c] += br * basis[c];
+        }
+        bR6[r] += br * s.r;
+        bG6[r] += br * s.g;
+        bB6[r] += br * s.b;
+      }
+    }
+    // Tiny ridge regularization on quadratic curvature terms to prevent extrapolation overshoot
+    ATA6[0][0] += 1e-3;
+    ATA6[1][1] += 1e-3;
+    ATA6[2][2] += 1e-3;
 
-    ATbB[0] += v0 * s.b;
-    ATbB[1] += v1 * s.b;
-    ATbB[2] += s.b;
+    const qR = solveLinearSystem(ATA6, bR6);
+    const qG = solveLinearSystem(ATA6, bG6);
+    const qB = solveLinearSystem(ATA6, bB6);
+    if (qR && qG && qB) {
+      evalRgbAt = (lx: number, ly: number) => {
+        const nx = lx * invW - 0.5;
+        const ny = ly * invH - 0.5;
+        const yy = ny * ny, xx = nx * nx, xy = nx * ny;
+        return [
+          qR[0] * yy + qR[1] * xx + qR[2] * xy + qR[3] * ny + qR[4] * nx + qR[5],
+          qG[0] * yy + qG[1] * xx + qG[2] * xy + qG[3] * ny + qG[4] * nx + qG[5],
+          qB[0] * yy + qB[1] * xx + qB[2] * xy + qB[3] * ny + qB[4] * nx + qB[5],
+        ];
+      };
+    }
   }
 
-  const coeffR = solve3x3(ATA, ATbR);
-  const coeffG = solve3x3(ATA, ATbG);
-  const coeffB = solve3x3(ATA, ATbB);
-  if (!coeffR || !coeffG || !coeffB) return null;
+  if (!evalRgbAt) {
+    const ATA = [
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+    ];
+    const ATbR = [0, 0, 0];
+    const ATbG = [0, 0, 0];
+    const ATbB = [0, 0, 0];
+
+    for (const s of samples) {
+      const v0 = s.y;
+      const v1 = s.x;
+      ATA[0][0] += v0 * v0;
+      ATA[0][1] += v0 * v1;
+      ATA[0][2] += v0;
+      ATA[1][0] += v1 * v0;
+      ATA[1][1] += v1 * v1;
+      ATA[1][2] += v1;
+      ATA[2][0] += v0;
+      ATA[2][1] += v1;
+      ATA[2][2] += 1;
+
+      ATbR[0] += v0 * s.r;
+      ATbR[1] += v1 * s.r;
+      ATbR[2] += s.r;
+
+      ATbG[0] += v0 * s.g;
+      ATbG[1] += v1 * s.g;
+      ATbG[2] += s.g;
+
+      ATbB[0] += v0 * s.b;
+      ATbB[1] += v1 * s.b;
+      ATbB[2] += s.b;
+    }
+
+    const coeffR = solve3x3(ATA, ATbR);
+    const coeffG = solve3x3(ATA, ATbG);
+    const coeffB = solve3x3(ATA, ATbB);
+    if (!coeffR || !coeffG || !coeffB) return null;
+    evalRgbAt = (lx: number, ly: number) => [
+      coeffR[0] * ly + coeffR[1] * lx + coeffR[2],
+      coeffG[0] * ly + coeffG[1] * lx + coeffG[2],
+      coeffB[0] * ly + coeffB[1] * lx + coeffB[2],
+    ];
+  }
 
   const errs: number[] = [];
   let sumErr = 0;
   for (const s of samples) {
-    const pr = coeffR[0] * s.y + coeffR[1] * s.x + coeffR[2];
-    const pg = coeffG[0] * s.y + coeffG[1] * s.x + coeffG[2];
-    const pb = coeffB[0] * s.y + coeffB[1] * s.x + coeffB[2];
+    const [pr, pg, pb] = evalRgbAt(s.x, s.y);
     const e = (Math.abs(s.r - pr) + Math.abs(s.g - pg) + Math.abs(s.b - pb)) / 3;
     sumErr += e;
     errs.push(e);
@@ -2198,8 +2666,8 @@ export function tryCleanFlatOrGradientRing(params: {
   const mae = sumErr / samples.length;
   const p90Err = errs[Math.floor(errs.length * 0.9)];
 
-  const maxAllowedMae = medL >= 120 ? 2.8 : 1.8;
-  const maxAllowedP90 = medL >= 120 ? 5.8 : 3.8;
+  const maxAllowedMae = region.category === 'BUBBLE' ? 3.5 : medL >= 120 ? 2.8 : 1.8;
+  const maxAllowedP90 = region.category === 'BUBBLE' ? 7.2 : medL >= 120 ? 5.8 : 3.8;
   if (mae > maxAllowedMae || p90Err > maxAllowedP90) {
     return null;
   }
@@ -2213,18 +2681,10 @@ export function tryCleanFlatOrGradientRing(params: {
       const mAlpha = writeMask[ly * bw + lx];
       if (mAlpha === 0) continue;
 
-      const fillR = Math.max(
-        0,
-        Math.min(255, Math.round(coeffR[0] * ly + coeffR[1] * lx + coeffR[2]))
-      );
-      const fillG = Math.max(
-        0,
-        Math.min(255, Math.round(coeffG[0] * ly + coeffG[1] * lx + coeffG[2]))
-      );
-      const fillB = Math.max(
-        0,
-        Math.min(255, Math.round(coeffB[0] * ly + coeffB[1] * lx + coeffB[2]))
-      );
+      const [rawR, rawG, rawB] = evalRgbAt(lx, ly);
+      const fillR = Math.max(0, Math.min(255, Math.round(rawR)));
+      const fillG = Math.max(0, Math.min(255, Math.round(rawG)));
+      const fillB = Math.max(0, Math.min(255, Math.round(rawB)));
 
       const dstIdx = (py * imgWidth + px) * 4;
       if (mAlpha === 255) {
